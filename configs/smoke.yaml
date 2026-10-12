@@ -20,10 +20,10 @@ pretrain:
 data:
   spike:
     format: pile_mmap    # converted copy (U30); same rows as format pile with the same max_rows and seed
-    root: /scratch/connectome/zres0710/iBrain_cache/neural-pile-primate-mmap
+    root: /pscratch/sd/z/zres0710/iBrain/cache/neural-pile-primate-mmap
     split: train
     exclude_sources: []
     max_rows: 200      # seeded random subset of pile rows
   ieeg:
-    - {format: ajile12, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/AJILE12/000055, max_hours: 0.5}
-    - {format: swec, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/SWEC/data, max_hours: 0.5}
+    - {format: ajile12, root: /pscratch/sd/z/zres0710/iBrain/pretrain/iEEG/AJILE12/000055, max_hours: 0.5}
+    - {format: swec, root: /pscratch/sd/z/zres0710/iBrain/pretrain/iEEG/SWEC/data, max_hours: 0.5}

@@ -2,17 +2,17 @@
 # Peak GPU memory per micro-batch shape, for choosing pretrain.token_budget (U33). Submit from the repo root:
 #   sbatch scripts/slurm/profile_memory.sbatch [config] [precision]
 #SBATCH --job-name=ibrain-profile
-#SBATCH --partition=debug
-#SBATCH --nodelist=node1
-#SBATCH --gres=gpu:1
+#SBATCH --account=m5187
+#SBATCH --constraint=gpu
+#SBATCH --qos=shared
+#SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=4G
+#SBATCH --cpus-per-task=32
 #SBATCH --time=01:00:00
 #SBATCH --output=./logs/%x_%j.out
 #SBATCH --error=./logs/%x_%j.err
 set -euo pipefail
-cd /scratch/connectome/zres0710/iBrain_replication
+cd /pscratch/sd/z/zres0710/iBrain_replication
 mkdir -p logs
 source .venv/bin/activate
 export PYTHONUNBUFFERED=1

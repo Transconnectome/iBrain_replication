@@ -14,19 +14,20 @@ pretrain:
   num_workers: 4
   shuffle_buffer: 1024   # iEEG windows held per worker for shuffling (about 0.25 GB at 124 channels)
 data:
-  # Prefix confirmed on the server 2026-09-29 (iBrain_pretrain/). Folders below it are from the 09-28 survey.
+  # NERSC prefix /pscratch/sd/z/zres0710/iBrain/{pretrain,downstream,cache} (moved from the lab server 2026-10-11).
+  # Folders below it are from the 09-28 survey.
   spike:
     # pile_mmap = memory-mapped copy of the Neural Pile primate parquet files (U10, U30), made once by
-    # scripts/slurm/pile_to_memmap.sbatch | pile = the parquet files (root: .../iBrain_pretrain/spikes/neural-pile-primate,
+    # scripts/slurm/pile_to_memmap.sbatch | pile = the parquet files (root: .../iBrain/pretrain/spikes/neural-pile-primate,
     # about 30 min to load) | corpus = nhp-spike-corpus shards | synthetic
     format: pile_mmap
-    root: /scratch/connectome/zres0710/iBrain_cache/neural-pile-primate-mmap
+    root: /pscratch/sd/z/zres0710/iBrain/cache/neural-pile-primate-mmap
     split: train
     exclude_sources: []   # as in the paper (U14). [perich, area2-bump] = variant without evaluation sessions
     max_rows: null       # seeded random subset of rows for small runs. null = all rows
   ieeg:                  # AJILE12 + SWEC, streamed by block (U31, U32). Skipped with --spike-only (M3)
-    - {format: ajile12, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/AJILE12/000055, max_hours: null}
-    - {format: swec, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/SWEC/data, max_hours: null}
+    - {format: ajile12, root: /pscratch/sd/z/zres0710/iBrain/pretrain/iEEG/AJILE12/000055, max_hours: null}
+    - {format: swec, root: /pscratch/sd/z/zres0710/iBrain/pretrain/iEEG/SWEC/data, max_hours: null}
 finetune:
   head: attn           # attn | mean | flatten (U8)
   epochs: 50
@@ -36,14 +37,14 @@ finetune:
   split_seed: 0        # fixed trial 80/20 split (M4). Independent of the run seed
   seeds: [0, 1, 2]     # U12
   datasets:            # scripts/finetune.py --dataset <name ...> (default: all). Folders checked on the server 2026-10-03
-    mc_maze:    {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/MC_Maze/000128, behavior: hand_vel}
-    area2_bump: {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/Area2_bump/000127, behavior: hand_vel}
-    perich_tco: {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/Monkey_long_term/000688,
+    mc_maze:    {format: nwb, root: /pscratch/sd/z/zres0710/iBrain/downstream/spikes/MC_Maze/000128, behavior: hand_vel}
+    area2_bump: {format: nwb, root: /pscratch/sd/z/zres0710/iBrain/downstream/spikes/Area2_bump/000127, behavior: hand_vel}
+    perich_tco: {format: nwb, root: /pscratch/sd/z/zres0710/iBrain/downstream/spikes/Monkey_long_term/000688,
                  glob: "sub-T/*ses-CO*.nwb", behavior: cursor_vel}   # monkey T, center-out, 6 sessions
-    perich_trt: {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/Monkey_long_term/000688,
+    perich_trt: {format: nwb, root: /pscratch/sd/z/zres0710/iBrain/downstream/spikes/Monkey_long_term/000688,
                  glob: "sub-T/*ses-RT*.nwb", behavior: cursor_vel}   # monkey T, random target, 6 sessions
-    treebank:   {format: treebank, root: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/data,
-                 split: heldout, cache_dir: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/cache}  # U34, U35; main: no notch, no re-reference
-    treebank_popt: {format: treebank, variant: true, root: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/data,
-                    split: heldout, cache_dir: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/cache,
+    treebank:   {format: treebank, root: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/data,
+                 split: heldout, cache_dir: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/cache}  # U34, U35; main: no notch, no re-reference
+    treebank_popt: {format: treebank, variant: true, root: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/data,
+                    split: heldout, cache_dir: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/cache,
                     reref: laplacian, notch_hz: [60, 120, 180, 240, 300, 360]}  # PopT signal condition (U34), only with --dataset treebank_popt

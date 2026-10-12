@@ -75,7 +75,7 @@ def main():
     ap.add_argument("--check-budget", type=int, default=None,
                     help="only check the largest micro-batches `pack` makes under this token_budget (n = budget // C, "
                          "at least 1) and exit 1 if one runs out of memory or peaks above --limit-gib")
-    ap.add_argument("--limit-gib", type=float, default=21.0)
+    ap.add_argument("--limit-gib", type=float, default=35.0)  # A100 40 GiB (Perlmutter); was 21 of the lab A5000's 24
     a = ap.parse_args()
     cfg = yaml.safe_load(Path(a.config).read_text())
     torch.manual_seed(0)

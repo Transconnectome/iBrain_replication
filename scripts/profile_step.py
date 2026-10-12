@@ -129,7 +129,7 @@ def main():
             print(f"  {label:22s} {NAMES[sig]:5s} wait {w:5.2f} s | {fb:5.2f} s | {op:5.3f} s   {nm:4.1f} micro-batches, "
                   f"{sl:7.0f} slots for {un:7.0f} units")
 
-    print("\n2. FLOPs of one step and TFLOP/s reached (A5000: about 110 dense bf16 TFLOP/s at peak)")
+    print("\n2. FLOPs of one step and TFLOP/s reached (A100: about 312 dense bf16 TFLOP/s at peak)")
     for sig in (SPIKE, IEEG):
         batch = next_batch(its, dls, sig)
         f = flops_of_step(model, batch, sig, amp, budget)

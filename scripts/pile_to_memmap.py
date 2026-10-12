@@ -1,6 +1,6 @@
 """One-time conversion of the Neural Pile parquet files to the memory-mapped layout read by format pile_mmap (U30).
 CPU only: run through scripts/slurm/pile_to_memmap.sbatch. Example:
-python scripts/pile_to_memmap.py --root <pile root> --out /scratch/connectome/zres0710/iBrain_cache/neural-pile-primate-mmap"""
+python scripts/pile_to_memmap.py --root <pile root> --out /pscratch/sd/z/zres0710/iBrain/cache/neural-pile-primate-mmap"""
 import argparse
 import json
 import sys
