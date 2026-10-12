@@ -1,6 +1,6 @@
 #!/bin/bash
 # Where the time of one pretraining step goes (scripts/profile_step.py). Submit from the repo root:
-#   sbatch scripts/slurm/profile_step.sbatch [config]
+#   sbatch scripts/slurm/profile_step.sbatch [config] [steps]   (steps > 8: DataLoader prefetch holds 4 workers x 2 batches)
 #SBATCH --job-name=ibrain-profstep
 #SBATCH --account=m5187
 #SBATCH --constraint=gpu
@@ -18,4 +18,4 @@ source .venv/bin/activate
 export HDF5_USE_FILE_LOCKING=FALSE
 export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
-python scripts/profile_step.py --config "${1:-configs/smoke.yaml}" --steps 8
+python scripts/profile_step.py --config "${1:-configs/smoke.yaml}" --steps "${2:-8}"

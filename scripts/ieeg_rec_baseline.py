@@ -5,7 +5,8 @@ masks (Eq. 6, 50% of tokens) and the same normalized windows as pretraining (U4 
   interp   linear interpolation in time between the neighbouring visible samples of the same channel
   init     a freshly initialized model (same seed), eval mode
   <ckpt>   each checkpoint given, eval mode
-plus the signal statistics behind them (heavy tails, power per band). CPU or GPU:
+plus the signal statistics behind them (heavy tails, power per band). --heldout evaluates on blocks the config does
+not train on, to tell fitting the training windows from generalizing. CPU or GPU:
   sbatch scripts/slurm/ieeg_rec_baseline.sbatch runs/smoke_s0/final.pt
 """
 import argparse
@@ -18,7 +19,7 @@ import numpy as np
 import torch
 import yaml
 
-from ibrain.data_ieeg import FS, ajile12_blocks, block_windows, normalize_block, read_block, select_hours, swec_blocks
+from ibrain.data_ieeg import FS, WINDOW_SAMPLES, ajile12_blocks, block_windows, normalize_block, read_block, select_hours, swec_blocks
 from ibrain.model import IBrain, IEEG, masked_mse
 from ibrain.pretrain import sample_mask
 from ibrain.repro import load_checkpoint, seed_all
@@ -86,6 +87,10 @@ def main():
     ap.add_argument("--n", type=int, default=256, help="windows per block (evenly spaced)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--bs", type=int, default=16)
+    ap.add_argument("--blocks", type=int, default=None,
+                    help="evaluate on this many blocks per source, drawn at random (default: all selected blocks)")
+    ap.add_argument("--heldout", action="store_true",
+                    help="draw the blocks from those the config does NOT select for training (same seed)")
     a = ap.parse_args()
     cfg = yaml.safe_load(Path(a.config).read_text())
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -101,15 +106,32 @@ def main():
         m.to(device).eval()
 
     blocks = []
+    pick = np.random.default_rng(a.seed + 1)
     for e in cfg["data"]["ieeg"]:
-        blocks += [(e["format"], b) for b in select_hours(READERS[e["format"]](e["root"]), e.get("max_hours"), a.seed)]
+        every = READERS[e["format"]](e["root"])
+        train = select_hours(every, e.get("max_hours"), a.seed)  # the blocks scripts/pretrain.py trains on
+        pool = [b for b in every if b not in train] if a.heldout else train
+        if a.blocks is not None and a.blocks < len(pool):
+            pool = [pool[i] for i in sorted(pick.choice(len(pool), a.blocks, replace=False))]
+        blocks += [(e["format"], b) for b in pool]
     names = ["zero", "ch_mean", "interp"] + [n for n, _ in models]
-    print(f"device={device} blocks={len(blocks)} windows/block<={a.n}")
+    print(f"device={device} blocks={len(blocks)} ({'held out' if a.heldout else 'training'}) windows/block<={a.n}")
     rng = np.random.default_rng(a.seed)
     tot = {n: [] for n in names}
     for fmt, b in blocks:
-        x = normalize_block(b, read_block(b))
-        w = np.stack(list(block_windows(b, x))).astype(np.float32)  # (N, C, S, P)
+        raw = read_block(b)
+        x = normalize_block(b, raw)
+        ws = list(block_windows(b, x))
+        if not ws:  # IEEGStream skips such a block in the same way; report why it gives no window
+            n_win = raw.shape[1] // WINDOW_SAMPLES
+            t0 = b.start / b.fs
+            in_bad = sum(any(u < t0 + (k + 1) * WINDOW_SAMPLES / FS and t0 + k * WINDOW_SAMPLES / FS < v
+                             for u, v in b.bad) for k in range(n_win))
+            print(f"\n== {fmt} {Path(b.path).name} [{b.start / b.fs:.0f}, {b.stop / b.fs:.0f}] s: no window, skipped | "
+                  f"channels {len(x)}/{len(raw)} usable, {n_win} windows: {in_bad} overlap bad intervals "
+                  f"({len(b.bad)} intervals), finite samples {np.isfinite(raw).mean():.3f}")
+            continue
+        w = np.stack(ws).astype(np.float32)  # (N, C, S, P)
         w = w[np.linspace(0, len(w) - 1, min(a.n, len(w))).round().astype(int)]
         torch.manual_seed(int(rng.integers(2 ** 31)))
         mask = sample_mask(torch.ones(w.shape[:2], dtype=torch.bool), w.shape[2]).numpy()
