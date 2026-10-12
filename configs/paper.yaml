@@ -4,8 +4,11 @@ pretrain:
   steps: null          # if null, epochs × (spike loader batches) × (number of loaders) (U20)
   epochs: 30
   warmup: 2000
-  batch_size: 32       # per type per GPU (SPEC 1.6)
-  grad_accum: 8        # 32 x 8 = 256 per step = the paper's 8 GPUs x 32 (U33). 4 GPUs (lab max) would need 2
+  batch_size: 256      # random windows per type per optimizer step = the paper's 8 GPUs x 32 per type (U33)
+  grad_accum: 1
+  token_budget: 2048   # micro-batch size in channel slots (windows x their max units), cut by unit count (U33)
+  precision: bf16      # autocast of the model forward; weights, optimizer and losses stay fp32 (U36)
+  grad_checkpoint: false  # activation checkpointing (U37); true if the token_budget check fails
   ckpt_every: 1000
   num_workers: 4
   shuffle_buffer: 1024   # iEEG windows held per worker for shuffling (about 0.25 GB at 124 channels)
@@ -28,3 +31,15 @@ finetune:
   batch_size: 32
   split_seed: 0        # fixed trial 80/20 split (M4). Independent of the run seed
   seeds: [0, 1, 2]     # U12
+  datasets:            # scripts/finetune.py --dataset <name ...> (default: all). Folders checked on the server 2026-10-03
+    mc_maze:    {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/MC_Maze/000128, behavior: hand_vel}
+    area2_bump: {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/Area2_bump/000127, behavior: hand_vel}
+    perich_tco: {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/Monkey_long_term/000688,
+                 glob: "sub-T/*ses-CO*.nwb", behavior: cursor_vel}   # monkey T, center-out, 6 sessions
+    perich_trt: {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/Monkey_long_term/000688,
+                 glob: "sub-T/*ses-RT*.nwb", behavior: cursor_vel}   # monkey T, random target, 6 sessions
+    treebank:   {format: treebank, root: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/data,
+                 split: heldout, cache_dir: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/cache}  # U34, U35; main: no notch, no re-reference
+    treebank_popt: {format: treebank, variant: true, root: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/data,
+                    split: heldout, cache_dir: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/cache,
+                    reref: laplacian, notch_hz: [60, 120, 180, 240, 300, 360]}  # PopT signal condition (U34), only with --dataset treebank_popt

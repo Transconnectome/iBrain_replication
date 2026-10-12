@@ -1,0 +1,28 @@
+# First real-data run on the lab server: paper model, batch and loaders on a small slice of the real data.
+# Checks that the readers, 256 windows per step cut into token_budget micro-batches in bf16 (U33, U36), checkpoints and
+# the 1:1 alternation work before paper.yaml. pretrain.sbatch first checks the budget's largest micro-batches on the GPU.
+# Loading 200 random pile rows still decompresses all 40 parquet files (about 35 min).
+#   sbatch --time=02:00:00 --job-name=ibrain-smoke scripts/slurm/pretrain.sbatch configs/smoke.yaml 0 runs/smoke_s0
+model: {d: 256, H: 8, ffn: 1024, L: 6, S: 10, P_spike: 5, P_ieeg: 50, p: 0.1, d_proj: 128}
+pretrain:
+  steps: 200           # 100 spike + 100 iEEG optimizer steps
+  epochs: null
+  warmup: 20           # below steps, so the cosine decay is exercised (U20, U33)
+  batch_size: 256      # same as paper.yaml (U33, U36, U37)
+  grad_accum: 1
+  token_budget: 2048
+  precision: bf16
+  grad_checkpoint: false
+  ckpt_every: 50
+  num_workers: 4
+  shuffle_buffer: 1024
+data:
+  spike:
+    format: pile
+    root: /storage/connectome/zres0710/iBrain_pretrain/spikes/neural-pile-primate
+    split: train
+    exclude_sources: []
+    max_rows: 200      # seeded random subset of pile rows
+  ieeg:
+    - {format: ajile12, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/AJILE12/000055, max_hours: 0.5}
+    - {format: swec, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/SWEC/data, max_hours: 0.5}

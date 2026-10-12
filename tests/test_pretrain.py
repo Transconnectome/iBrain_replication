@@ -6,7 +6,8 @@ from torch.utils.data import DataLoader
 
 from ibrain.data_spike import SYNTHETIC, SpikeWindows, collate, read_windows, write_synthetic
 from ibrain.model import IBrain, SPIKE, masked_poisson_nll
-from ibrain.pretrain import LR, LR_MIN, lr_at, pretrain, sample_mask, sample_views, total_steps
+from ibrain import pretrain as pt
+from ibrain.pretrain import LR, LR_MIN, batch_losses, lr_at, pack, pretrain, sample_mask, sample_views, total_steps
 
 
 def valid_of(ns, C):
@@ -165,3 +166,88 @@ def test_accumulation_draws_accum_batches_per_step(tmp_path):
     torch.manual_seed(0)
     hist = pretrain(IBrain(d=16, H=2, ffn=32, L=1, d_proj=8), [(SPIKE, dl)], steps=5, warmup=1, accum=3)
     assert len(hist) == 5 and len(drawn) == 5 * 3 * 4
+
+
+def test_bf16_precision(tmp_path):
+    """U36: bf16 autocast runs the same loop, keeps float32 weights and finite float32 losses; unknown names raise."""
+    write_synthetic(tmp_path, (3, 8), n_windows=8)
+    dl = DataLoader(SpikeWindows(read_windows(tmp_path, SYNTHETIC)), batch_size=4, shuffle=True, collate_fn=collate)
+    torch.manual_seed(0)
+    m = IBrain(d=16, H=2, ffn=32, L=1, d_proj=8)
+    hist = pretrain(m, [(SPIKE, dl)], steps=3, warmup=1, precision="bf16")
+    assert len(hist) == 3 and all(math.isfinite(h["rec"]) and math.isfinite(h["align"]) for h in hist)
+    assert all(p.dtype == torch.float32 for p in m.parameters())
+    try:
+        pretrain(m, [(SPIKE, dl)], steps=1, warmup=1, precision="fp16")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown precision must raise")
+
+
+def test_pack_budget():
+    """U33: every window lands in exactly one micro-batch, sorted by unit count, within the channel-slot budget."""
+    torch.manual_seed(0)
+    n = torch.cat([torch.randint(1, 120, (250,)), torch.tensor([1734, 1700, 900, 600, 512, 300])])
+    chunks = pack(n, budget=2048)
+    assert sorted(torch.cat(chunks).tolist()) == list(range(len(n)))
+    for c in chunks:
+        assert len(c) * n[c].max() <= 2048 or len(c) == 1
+    assert [int(n[c].max()) for c in chunks] == sorted((int(n[c].max()) for c in chunks), reverse=True)
+    assert len(pack(n, None)) == 1
+
+
+def test_packed_gradient_equals_whole_batch(tmp_path, monkeypatch):
+    """U33: micro-batches with the loss weights of batch_losses give the whole-batch gradient. Masks and views are made
+    deterministic per window (same count as U15/U16) so both computations see the same draws; dropout is off."""
+    def mask_fn(valid, S):
+        B, C = valid.shape
+        tok = valid[:, :, None].expand(B, C, S).reshape(B, C * S)
+        rank = torch.arange(C * S).expand(B, -1).masked_fill(~tok, C * S)
+        return (rank < tok.sum(1, keepdim=True) // 2).view(B, C, S)
+
+    def views_fn(valid):
+        k = torch.arange(valid.shape[1])
+        return valid & (k % 3 != 1), valid & (k % 3 != 2)
+
+    monkeypatch.setattr(pt, "sample_mask", mask_fn)
+    monkeypatch.setattr(pt, "sample_views", views_fn)
+    torch.manual_seed(0)
+    ns = [3, 40, 5, 17, 2, 40, 9, 1]
+    x = torch.poisson(torch.full((len(ns), max(ns), 10, 5), 0.5))
+    valid = valid_of(ns, max(ns))
+    x[~valid] = 0.0
+    m = IBrain(d=16, H=2, ffn=32, L=1, d_proj=8, p=0.0)
+
+    def grads(budget):
+        m.zero_grad(set_to_none=True)
+        losses = batch_losses(m, x, valid, SPIKE, budget=budget)
+        return losses, [q.grad.clone() for q in m.parameters() if q.grad is not None]
+
+    (r0, a0), g0 = grads(None)
+    (r1, a1), g1 = grads(45)  # several micro-batches, the two 40-unit windows each alone or paired
+    assert len(pack(valid.sum(1), 45)) > 2
+    assert math.isclose(r0, r1, rel_tol=1e-5) and math.isclose(a0, a1, rel_tol=1e-5)
+    assert len(g0) == len(g1) and all(torch.allclose(u, v, atol=1e-6, rtol=1e-4) for u, v in zip(g0, g1))
+
+
+def test_grad_checkpoint_same_gradient():
+    """U37: activation checkpointing changes memory and time only. Same loss and gradient with dropout on, because
+    the recomputation restores the RNG state of the forward."""
+    torch.manual_seed(0)
+    ns = [3, 7, 5]
+    x, valid = torch.poisson(torch.full((3, 7, 10, 5), 0.5)), valid_of(ns, 7)
+    m = IBrain(d=16, H=2, ffn=32, L=2, d_proj=8, p=0.1).train()
+
+    def run(ckpt):
+        m.grad_checkpoint = ckpt
+        m.zero_grad(set_to_none=True)
+        torch.manual_seed(1)
+        rec, align = pt.step_losses(m, x, valid, SPIKE)
+        (rec + align).backward()
+        return float((rec + align).detach()), [q.grad.clone() for q in m.parameters() if q.grad is not None]
+
+    l0, g0 = run(False)
+    l1, g1 = run(True)
+    assert math.isclose(l0, l1, rel_tol=1e-6)
+    assert all(torch.allclose(u, v, atol=1e-6, rtol=1e-5) for u, v in zip(g0, g1))

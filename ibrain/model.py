@@ -4,6 +4,7 @@ Encoders (spike MLP, iEEG conv + residual linear), shared criss-cross ST backbon
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 SPIKE, IEEG = 0, 1  # e_type index (Eq. 2). Same as the index into the enc/dec/type_emb lists
 
@@ -108,9 +109,10 @@ class Backbone(nn.Module):
         self.blocks = nn.ModuleList([CrissCrossBlock(d, H, ffn, S, p) for _ in range(L)])
         self.norm = nn.LayerNorm(d)
 
-    def forward(self, z, valid):
+    def forward(self, z, valid, ckpt=False):
+        """ckpt: activation checkpointing per block (U37), recomputes each block in backward instead of storing it."""
         for b in self.blocks:
-            z = b(z, valid)
+            z = checkpoint(b, z, valid, use_reentrant=False) if ckpt else b(z, valid)
         return self.norm(z)
 
 
@@ -127,11 +129,15 @@ class IBrain(nn.Module):
         # channel-view alignment head (Eq. 12, U7). projection d -> 128, predictor 128 -> 64 -> 128
         self.proj = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d_proj))
         self.pred = nn.Sequential(nn.Linear(d_proj, d_proj // 2), nn.GELU(), nn.Linear(d_proj // 2, d_proj))
+        # Activation checkpointing of the encoder and each backbone block while training (U37). A runtime switch,
+        # not a weight: it changes memory and time only, the outputs and gradients are the same
+        self.grad_checkpoint = False
 
     def encode(self, x, valid, sig=SPIKE):  # (B, C, S, P_sig), (B, C) -> U (B, C, S, d)
-        h = self.enc[sig](x)  # Eq. 1
+        ckpt = self.grad_checkpoint and self.training and torch.is_grad_enabled()
+        h = checkpoint(self.enc[sig], x, use_reentrant=False) if ckpt else self.enc[sig](x)  # Eq. 1
         z = h + self.type_emb[sig] + self.time_emb  # Eq. 2
-        return self.backbone(z, valid)  # Eq. 5
+        return self.backbone(z, valid, ckpt)  # Eq. 5
 
     def reconstruct(self, u, sig=SPIKE):  # Eq. 7
         return self.dec[sig](u)

@@ -18,3 +18,5 @@ finetune:
   batch_size: 16
   split_seed: 0
   seeds: [0, 1]
+  datasets:
+    synthetic: {format: synthetic}   # M4 synthetic regression, no files

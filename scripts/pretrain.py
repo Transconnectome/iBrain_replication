@@ -87,17 +87,21 @@ def main():
         loaders.append((IEEG, loader(ds_ieeg, pc["batch_size"], g, workers)))
     accum = pc.get("grad_accum", 1)  # U33
     steps = pc["steps"] or total_steps(pc["epochs"], len(dl_spike), len(loaders), accum)  # U20: x2 under 1:1 alternation
+    precision = pc.get("precision", "fp32")  # U36
     meta["data"] = {"spike_windows": len(ds_spike), "spike_hours": spike_h, "ieeg_hours": ieeg_h, "steps": steps,
-                    "grad_accum": accum, "windows_per_step": pc["batch_size"] * accum}
+                    "grad_accum": accum, "windows_per_step": pc["batch_size"] * accum, "precision": precision,
+                    "token_budget": pc.get("token_budget"), "grad_checkpoint": pc.get("grad_checkpoint", False)}
     write_json(out / "meta.json", meta)
-    print(f"steps={steps} spike batches/epoch={len(dl_spike)} grad_accum={accum} loaders={len(loaders)} device={a.device}")
+    print(f"steps={steps} spike batches/epoch={len(dl_spike)} grad_accum={accum} loaders={len(loaders)} device={a.device} "
+          f"precision={precision}")
     if pc["warmup"] >= steps:
         print(f"WARNING: warmup {pc['warmup']} >= {steps} steps: lr never reaches its peak and the cosine decay never runs. "
               "Lower pretrain.warmup for small runs (U20, U33)")
 
     model = IBrain(**cfg["model"])
     pretrain(model, loaders, steps, pc["warmup"], a.device, out_dir=out, ckpt_every=pc["ckpt_every"],
-             resume=a.resume, meta=meta, accum=accum)
+             resume=a.resume, meta=meta, accum=accum, precision=precision,
+             token_budget=pc.get("token_budget"), grad_checkpoint=pc.get("grad_checkpoint", False))
 
 
 if __name__ == "__main__":

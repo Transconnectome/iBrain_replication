@@ -121,6 +121,16 @@ def read_block(b, pad_seconds=1.0):
 MIN_STAT_SECONDS, MIN_SCALE_RATIO = 30, 1e-3
 
 
+def usable_channels(n_finite, scale):
+    """Channels whose statistics can be used (U4, U31): at least MIN_STAT_SECONDS of finite samples, and a finite
+    scale of at least MIN_SCALE_RATIO times the median scale of the channels that pass those checks. n_finite, scale (C,) of one
+    statistics unit (block or chunk) -> (C,) bool."""
+    ok = (np.asarray(n_finite) >= MIN_STAT_SECONDS * FS) & np.isfinite(scale) & (scale > 0)
+    if ok.any():
+        ok &= scale >= MIN_SCALE_RATIO * np.median(scale[ok])
+    return ok
+
+
 def normalize_block(b, x):
     """U4 at chunk level for one streamed block, x (C, L) at 500 Hz -> (C', L) normalized, C' <= C.
     Statistics ignore NaN samples and samples inside bad intervals (their windows are dropped anyway, and non-NaN
@@ -137,9 +147,7 @@ def normalize_block(b, x):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN channels give NaN statistics and are left out below
         c, sc = channel_stats(u)
-    ok = (np.isfinite(u).sum(1) >= MIN_STAT_SECONDS * FS) & np.isfinite(sc) & (sc > 0)
-    if ok.any():
-        ok &= sc >= MIN_SCALE_RATIO * np.median(sc[ok])
+    ok = usable_channels(np.isfinite(u).sum(1), sc)
     return channel_normalize(x[ok], c[ok], sc[ok]).astype(np.float32)
 
 
