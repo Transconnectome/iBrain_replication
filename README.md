@@ -92,6 +92,12 @@ Then you can run the paper's joint pretraining, alternating spike and iEEG batch
 sbatch scripts/slurm/pretrain.sbatch configs/paper.yaml 0 runs/joint_s0
 ```
 
+For iEEG pilots, `--ieeg-only` is the counterpart of `--spike-only`: every step is an iEEG step and no spike data is read. The iEEG stream has no length, so set `pretrain.steps` in the config:
+
+```bash
+sbatch scripts/slurm/pretrain.sbatch <config> 0 runs/ieeg_s0 --ieeg-only
+```
+
 ### Brain Treebank
 The `treebank` entry builds the Pitch, Volume, Onset and Speech examples of the [Brain Treebank](https://braintreebank.dev) with the PopT rules, cut to 1 s windows at 500 Hz (SPEC U34). Each of the 7 subjects with more than one trial is fine-tuned on its other trials and tested on its held-out PopT trial. The model encodes with the iEEG encoder and iEEG type embedding of pretraining, the head gives one logit per window, and the score is AUC averaged over subjects (SPEC U35). Only the three neural arms run; there is no linear baseline. With `cache_dir`, every trial is read and filtered once for all four tasks.
 

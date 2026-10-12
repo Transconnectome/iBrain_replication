@@ -17,6 +17,7 @@ pretrain:
   ckpt_every: 50
   num_workers: 4
   shuffle_buffer: 1024
+  open_blocks: 8         # iEEG blocks each DataLoader worker mixes at once; a batch comes from one worker (U41)
 data:
   spike:
     format: pile_mmap    # converted copy (U30); same rows as format pile with the same max_rows and seed

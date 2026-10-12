@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ibrain.data_spike import SYNTHETIC, SpikeWindows, collate, read_windows, write_synthetic
-from ibrain.model import IBrain, SPIKE, masked_poisson_nll
+from ibrain.model import IBrain, IEEG, SPIKE, masked_poisson_nll
 from ibrain import pretrain as pt
 from ibrain.pretrain import LR, LR_MIN, batch_losses, lr_at, pack, pretrain, sample_mask, sample_views, total_steps
 
@@ -147,6 +147,40 @@ def test_script_joint_step_count(tmp_path):
             assert meta["data"]["steps"] == len(log) == -(-2 * spike_batches // accum) * n_loaders
             drawn = sum(h["sig"] == SPIKE for h in log) * accum
             assert 0 <= drawn - 2 * spike_batches < accum  # 2 epochs, plus less than one accumulation group
+
+
+def test_script_ieeg_only(tmp_path):
+    """U42: --ieeg-only mirrors --spike-only. Every step is an iEEG step and no spike data is read; with a map-style
+    iEEG source (synthetic) epochs count passes over the iEEG loader. It excludes --spike-only and needs data.ieeg."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    import yaml
+    root = Path(__file__).resolve().parent.parent
+    cfg = yaml.safe_load((root / "configs/tiny.yaml").read_text())
+    cfg["model"].update(d=16, H=2, ffn=32, L=1, d_proj=8)
+    cfg["pretrain"].update(steps=None, epochs=2, warmup=1, ckpt_every=1000)
+
+    def run(c, *extra):
+        (tmp_path / "c.yaml").write_text(yaml.safe_dump(c))
+        out = tmp_path / f"run{len(list(tmp_path.iterdir()))}"
+        r = subprocess.run([sys.executable, str(root / "scripts/pretrain.py"), "--config", str(tmp_path / "c.yaml"),
+                            "--out", str(out), "--device", "cpu", *extra], capture_output=True, text=True, cwd=root)
+        return r, out
+
+    r, out = run(cfg, "--ieeg-only")
+    assert r.returncode == 0, r.stderr[-1500:]
+    meta = json.loads((out / "meta.json").read_text())
+    log = [json.loads(line) for line in (out / "log.jsonl").read_text().splitlines()]
+    ieeg_batches = -(-3 * 16 // cfg["pretrain"]["batch_size"])  # SyntheticIEEG: 3 sessions x 16 windows
+    assert meta["data"]["mode"] == "ieeg_only" and meta["data"]["spike_windows"] is None
+    assert meta["data"]["steps"] == len(log) == 2 * ieeg_batches and all(h["sig"] == IEEG for h in log)
+    assert not (out / "data").exists()  # the synthetic spike shards were never written
+    r, _ = run(cfg, "--ieeg-only", "--spike-only")
+    assert r.returncode != 0 and "not allowed with" in r.stderr
+    r, _ = run({**cfg, "data": {**cfg["data"], "ieeg": None}}, "--ieeg-only")
+    assert r.returncode != 0 and "needs data.ieeg" in r.stderr
 
 
 def test_accumulation_draws_accum_batches_per_step(tmp_path):

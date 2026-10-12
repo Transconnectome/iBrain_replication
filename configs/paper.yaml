@@ -13,6 +13,7 @@ pretrain:
   ckpt_every: 1000
   num_workers: 4
   shuffle_buffer: 1024   # iEEG windows held per worker for shuffling (about 0.25 GB at 124 channels)
+  open_blocks: 8         # iEEG blocks each DataLoader worker mixes at once; a batch comes from one worker (U41)
 data:
   # NERSC prefix /pscratch/sd/z/zres0710/iBrain/{pretrain,downstream,cache} (moved from the lab server 2026-10-11).
   # Folders below it are from the 09-28 survey.

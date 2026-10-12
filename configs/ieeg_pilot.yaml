@@ -1,0 +1,28 @@
+# iEEG-only pilot (U42): does iEEG L_rec go below the zero predictor with more steps? The smoke run stayed at it
+# (1.91 vs 1.93 after 100 iEEG steps, scripts/ieeg_rec_baseline.py). Paper model and batch, iEEG only:
+#   sbatch --time=04:00:00 --job-name=ieeg-pilot scripts/slurm/pretrain.sbatch configs/ieeg_pilot.yaml 0 runs/ieeg_pilot_s0 --ieeg-only
+# 5 h of each iEEG set: about 45 blocks, so each of the 4 workers has more than open_blocks (8) to mix (U41).
+model: {d: 256, H: 8, ffn: 1024, L: 6, S: 10, P_spike: 5, P_ieeg: 50, p: 0.1, d_proj: 128, head_bn: true, head_bn_group: 32}  # as paper.yaml
+pretrain:
+  steps: 3000          # required with --ieeg-only: the iEEG stream has no length (U42)
+  epochs: null
+  warmup: 200
+  batch_size: 256
+  grad_accum: 1
+  token_budget: 2048
+  precision: bf16
+  grad_checkpoint: false
+  compile: true
+  ckpt_every: 250
+  keep_every: 500      # snapshots for scripts/ieeg_rec_baseline.py and check_collapse.py
+  num_workers: 4
+  shuffle_buffer: 1024
+  open_blocks: 8
+data:
+  spike:               # not read with --ieeg-only
+    format: pile_mmap
+    root: /pscratch/sd/z/zres0710/iBrain/cache/neural-pile-primate-mmap
+    split: train
+  ieeg:
+    - {format: ajile12, root: /pscratch/sd/z/zres0710/iBrain/pretrain/iEEG/AJILE12/000055, max_hours: 5}
+    - {format: swec, root: /pscratch/sd/z/zres0710/iBrain/pretrain/iEEG/SWEC/data, max_hours: 5}

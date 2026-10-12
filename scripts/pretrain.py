@@ -1,7 +1,7 @@
 """Run pretraining. Example: python scripts/pretrain.py --config configs/tiny.yaml --seed 0 --out runs/tiny_s0
 Spike data: Neural Pile (format pile, or pile_mmap for the converted copy of scripts/pile_to_memmap.py), nhp-spike-corpus
 shards (corpus) or synthetic. iEEG data: a list of AJILE12 and SWEC sources streamed by block, "synthetic", or null.
---spike-only ignores iEEG (M3).
+--spike-only ignores iEEG (M3); --ieeg-only ignores spike data (iEEG pilots, U42).
 Outputs: out/meta.json, log.jsonl, ckpt.pt (latest), final.pt. Resume with --resume out/ckpt.pt."""
 import argparse
 import itertools
@@ -43,8 +43,8 @@ def spike_data(sc, out, seed):
     return ds, len(ds) / 3600
 
 
-def ieeg_data(ic, seed, buffer):
-    """data.ieeg -> (Dataset, hours)."""
+def ieeg_data(ic, seed, buffer, open_blocks=8):
+    """data.ieeg -> (Dataset, hours). open_blocks: blocks each DataLoader worker mixes at once (U41)."""
     if ic == "synthetic":
         return SyntheticIEEG(n_windows=16, seed=seed), None
     blocks = []
@@ -52,7 +52,7 @@ def ieeg_data(ic, seed, buffer):
         bl = select_hours(IEEG_SOURCES[e["format"]](e["root"]), e.get("max_hours"), seed)
         print(f"iEEG {e['format']}: {len(bl)} blocks, {sum((b.stop - b.start) / b.fs for b in bl) / 3600:.1f} h")
         blocks += bl
-    ds = IEEGStream(blocks, buffer)
+    ds = IEEGStream(blocks, buffer, open_blocks=open_blocks)
     return ds, ds.hours
 
 
@@ -68,7 +68,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
     ap.add_argument("--resume", default=None)
-    ap.add_argument("--spike-only", action="store_true", help="ignore data.ieeg (spike-only pretraining, M3)")
+    only = ap.add_mutually_exclusive_group()
+    only.add_argument("--spike-only", action="store_true", help="ignore data.ieeg (spike-only pretraining, M3)")
+    only.add_argument("--ieeg-only", "--iEEG-only", dest="ieeg_only", action="store_true",
+                      help="ignore data.spike (iEEG-only pretraining, U42); a streamed iEEG source needs pretrain.steps")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
     cfg = yaml.safe_load(Path(a.config).read_text(encoding="utf-8"))
@@ -80,22 +83,36 @@ def main():
     pc, dc = cfg["pretrain"], cfg["data"]
     workers = pc.get("num_workers", 0)
     g = torch.Generator().manual_seed(a.seed)
-    ds_spike, spike_h = spike_data(dc["spike"], out, a.seed)
-    dl_spike = loader(ds_spike, pc["batch_size"], g, workers)
-    loaders, ieeg_h = [(SPIKE, dl_spike)], None
+    if a.ieeg_only and not dc.get("ieeg"):
+        sys.exit("--ieeg-only needs data.ieeg")
+    loaders, ds_spike, spike_h, ieeg_h = [], None, None, None
+    if not a.ieeg_only:
+        ds_spike, spike_h = spike_data(dc["spike"], out, a.seed)
+        loaders.append((SPIKE, loader(ds_spike, pc["batch_size"], g, workers)))
     if dc.get("ieeg") and not a.spike_only:
-        ds_ieeg, ieeg_h = ieeg_data(dc["ieeg"], a.seed, pc.get("shuffle_buffer", 1024))
+        ds_ieeg, ieeg_h = ieeg_data(dc["ieeg"], a.seed, pc.get("shuffle_buffer", 1024), pc.get("open_blocks", 8))
         loaders.append((IEEG, loader(ds_ieeg, pc["batch_size"], g, workers)))
     accum = pc.get("grad_accum", 1)  # U33
-    steps = pc["steps"] or total_steps(pc["epochs"], len(dl_spike), len(loaders), accum)  # U20: x2 under 1:1 alternation
+    steps = pc["steps"]
+    if not steps:  # U20: epochs count passes over the spike loader, x2 under 1:1 alternation
+        if not a.ieeg_only:
+            steps = total_steps(pc["epochs"], len(loaders[0][1]), len(loaders), accum)
+        elif isinstance(ds_ieeg, IterableDataset):
+            sys.exit("--ieeg-only with a streamed iEEG source needs pretrain.steps: the stream has no length to count "
+                     "epochs over")
+        else:  # iEEG-only with a map-style source (synthetic): epochs count passes over the iEEG loader
+            steps = total_steps(pc["epochs"], len(loaders[0][1]), 1, accum)
     precision = pc.get("precision", "fp32")  # U36
-    meta["data"] = {"spike_windows": len(ds_spike), "spike_hours": spike_h, "ieeg_hours": ieeg_h, "steps": steps,
+    mode = "spike_only" if a.spike_only or not dc.get("ieeg") else "ieeg_only" if a.ieeg_only else "joint"
+    meta["data"] = {"mode": mode, "spike_windows": len(ds_spike) if ds_spike is not None else None,
+                    "spike_hours": spike_h, "ieeg_hours": ieeg_h, "steps": steps,
                     "grad_accum": accum, "windows_per_step": pc["batch_size"] * accum, "precision": precision,
                     "token_budget": pc.get("token_budget"), "grad_checkpoint": pc.get("grad_checkpoint", False),
                     "compile": pc.get("compile", False)}
     write_json(out / "meta.json", meta)
-    print(f"steps={steps} spike batches/epoch={len(dl_spike)} grad_accum={accum} loaders={len(loaders)} device={a.device} "
-          f"precision={precision}")
+    n_spike = len(loaders[0][1]) if ds_spike is not None else None
+    print(f"mode={mode} steps={steps} spike batches/epoch={n_spike} grad_accum={accum} loaders={len(loaders)} "
+          f"device={a.device} precision={precision}")
     if pc["warmup"] >= steps:
         print(f"WARNING: warmup {pc['warmup']} >= {steps} steps: lr never reaches its peak and the cosine decay never runs. "
               "Lower pretrain.warmup for small runs (U20, U33)")
