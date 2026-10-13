@@ -2,6 +2,7 @@
 masks (Eq. 6, 50% of tokens) and the same normalized windows as pretraining (U4 per block), the masked MSE (Eq. 9) of
   zero     predicting 0 (the block median): E[x^2] over masked patches
   ch_mean  each channel's mean over its visible patches of the window
+  sp_mean  per sample, the mean over the channels visible at the same patch (0 if none is)
   interp   linear interpolation in time between the neighbouring visible samples of the same channel
   init     a freshly initialized model (same seed), eval mode
   <ckpt>   each checkpoint given, eval mode
@@ -47,6 +48,12 @@ def ch_mean_pred(x, mask):
     vis = (~mask)[..., None].astype(x.dtype)
     m = (x * vis).sum((1, 2)) / np.maximum(vis.sum((1, 2)) * x.shape[2], 1)
     return np.broadcast_to(m[:, None, None], x.shape)
+
+
+def sp_mean_pred(x, mask):
+    vis = (~mask)[..., None].astype(x.dtype)
+    m = (x * vis).sum(0) / np.maximum(vis.sum(0), 1)  # (S, P)
+    return np.broadcast_to(m[None], x.shape)
 
 
 @torch.no_grad()
@@ -114,7 +121,7 @@ def main():
         if a.blocks is not None and a.blocks < len(pool):
             pool = [pool[i] for i in sorted(pick.choice(len(pool), a.blocks, replace=False))]
         blocks += [(e["format"], b) for b in pool]
-    names = ["zero", "ch_mean", "interp"] + [n for n, _ in models]
+    names = ["zero", "ch_mean", "sp_mean", "interp"] + [n for n, _ in models]
     print(f"device={device} blocks={len(blocks)} ({'held out' if a.heldout else 'training'}) windows/block<={a.n}")
     rng = np.random.default_rng(a.seed)
     tot = {n: [] for n in names}
@@ -143,6 +150,7 @@ def main():
               f"{'/'.join(f'{v:.2f}' for v in band_power(w))}")
         preds = {"zero": np.zeros_like(w),
                  "ch_mean": np.stack([ch_mean_pred(xi, mi) for xi, mi in zip(w, mask)]),
+                 "sp_mean": np.stack([sp_mean_pred(xi, mi) for xi, mi in zip(w, mask)]),
                  "interp": np.stack([interp_pred(xi, mi) for xi, mi in zip(w, mask)])}
         for n, m in models:
             preds[n] = model_pred(m, w, mask, device, a.bs)
