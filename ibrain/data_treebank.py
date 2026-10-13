@@ -7,7 +7,9 @@ at 500 Hz:
   onset: 1 = first word of a sentence (is_onset); 0 = a 1 s stretch of the movie grid that overlaps no word. Balanced.
   speech: 1 = any word; 0 = as for onset. Balanced.
 A window is 1 s centered on the word onset (PopT centers its 5 s window) or on the non-word stretch. The non-word
-grid and its margin from the recording ends are 1 s too (PopT: 5 s), so the negatives are not PopT's.
+grid and its margin from the recording ends are 1 s too (PopT: 5 s), so the negatives are not PopT's. Non-word
+stretches also miss the words PopT drops for a NaN feature (nonword_nan_rows); speech_negatives="movie" is a variant
+that draws the speech negatives only while the movie plays (PopT: the whole recording).
 Signal (main condition, the same input as pretraining): the PopT electrodes (BrainBERT's clean Laplacian rule),
 2048 -> 500 Hz, then U4 normalization. A channel that is flat or mostly NaN in a statistics chunk
 (data_ieeg.usable_channels, the pretraining rule) is set to 0 there and marked channel_ok False, which collate turns
@@ -128,19 +130,46 @@ def sample_index(t, movie_time, index, fs=TB_FS, batch=256):
 def read_words(root, subject, trial):
     """Words of the movie shown in one trial, aligned to the recording. As in PopT: rows of features.csv with any NaN
     are dropped, then words from the first one that starts after the movie time of the last row onward. Returns
-    arrays start, end (native sample index), is_onset (bool), rms, pitch."""
+    arrays start, end (native sample index), is_onset (bool), rms, pitch, and nan_start, nan_end: the dropped rows that
+    still have a start and an end within the timings (a word whose other features are missing, e.g. pitch), for the
+    non-word overlap check (U34 b). About half of the NaN rows have no start or end (split contractions such as
+    "n't") and cannot be placed."""
     import pandas as pd
     root = Path(root)
     movie = json.loads((root / "subject_metadata" / f"{subject}_{trial}_metadata.json").read_text())["filename"]
-    df = pd.read_csv(root / "transcripts" / movie / "features.csv").set_index("Unnamed: 0").dropna()
-    df = df.reset_index(drop=True)
+    full = pd.read_csv(root / "transcripts" / movie / "features.csv").set_index("Unnamed: 0")
+    nan = full.isna().any(axis=1)
+    df = full[~nan].reset_index(drop=True)
     trig = pd.read_csv(root / "subject_timings" / f"{subject}_{trial}_timings.csv")
     mt, ix = trig["movie_time"].to_numpy(np.float64), trig["index"].to_numpy(np.float64)
     start, end = df["start"].to_numpy(np.float64), df["end"].to_numpy(np.float64)
     n = len(start) if (start <= mt[-1]).all() else int(np.argmax(start > mt[-1]))  # PopT breaks at the first one
+    ns, ne = full.loc[nan, "start"].to_numpy(np.float64), full.loc[nan, "end"].to_numpy(np.float64)
+    timed = np.isfinite(ns) & np.isfinite(ne) & (ns <= mt[-1])
     return {"start": sample_index(start[:n], mt, ix), "end": sample_index(end[:n], mt, ix),
             "is_onset": df["is_onset"].to_numpy()[:n].astype(bool),
-            "rms": df["rms"].to_numpy(np.float64)[:n], "pitch": df["pitch"].to_numpy(np.float64)[:n]}
+            "rms": df["rms"].to_numpy(np.float64)[:n], "pitch": df["pitch"].to_numpy(np.float64)[:n],
+            "nan_start": sample_index(ns[timed], mt, ix), "nan_end": sample_index(ne[timed], mt, ix)}
+
+
+def movie_segments(root, subject, trial, n_native):
+    """Stretches of the recording where the movie plays, as (start, stop) native sample indices, from the event rows of
+    the timings file: beginning and unpause start playback, pause and end stop it. The sequences vary (a pause right
+    before an end, a short beginning/end false start, a recording that ends while playing), so this is a state
+    machine over the events in time order; playback still on at the last event runs to the end of the recording."""
+    import pandas as pd
+    t = pd.read_csv(Path(root) / "subject_timings" / f"{subject}_{trial}_timings.csv")
+    ev = t[t["type"] != "trigger"].sort_values("index", kind="stable")
+    out, on = [], None
+    for kind, i in zip(ev["type"], ev["index"].to_numpy(np.float64)):
+        if kind in ("beginning", "unpause") and on is None:
+            on = int(round(i))
+        elif kind in ("pause", "end") and on is not None:
+            out.append((on, int(round(i))))
+            on = None
+    if on is not None:
+        out.append((on, int(n_native)))
+    return [(a, b) for a, b in out if b > a]
 
 
 def quartile_examples(values):
@@ -151,14 +180,18 @@ def quartile_examples(values):
     return np.concatenate([lo, hi]), np.repeat([0, 1], [len(lo), len(hi)])
 
 
-def nonword_centers(start, end, n_native, length):
+def nonword_centers(start, end, n_native, length, segments=None):
     """PopT get_aligned_linguistic_control_matrix: the recording cut into consecutive `length`-sample intervals from
     sample 0; an interval counts when it overlaps no word (open overlap, s < b and e > a) and its center is more than
-    `length` samples from both ends. Returns the centers."""
+    `length` samples from both ends. segments: if given, (start, stop) stretches an interval must lie within entirely
+    (movie_segments, the speech_negatives="movie" variant). Returns the centers."""
     k = np.arange(n_native // length)
     a, b = k * length, (k + 1) * length
     c = (a + b) // 2
     keep = (c - length > 0) & (c + length < n_native)
+    if segments is not None:
+        keep &= np.zeros(len(a), dtype=bool) if not segments else np.any(
+            [(a >= lo) & (b <= hi) for lo, hi in segments], axis=0)
     if len(start) == 0:
         return c[keep]
     order = np.argsort(start, kind="stable")
@@ -168,18 +201,25 @@ def nonword_centers(start, end, n_native, length):
     return c[~hit & keep]
 
 
-def task_examples(words, n_native, task, fs=TB_FS, seconds=1.0):
+def task_examples(words, n_native, task, fs=TB_FS, seconds=1.0, nonword_nan_rows=True, segments=None):
     """One trial -> (centers (N,) native sample index, labels (N,) int) in PopT order. pitch / volume: word onsets of
     the two quartiles. onset / speech: positives (sentence onsets / all words) then non-word intervals, both subsampled
     to the smaller count with random.seed(42) and random.sample as PopT. The non-word intervals are `seconds` long and
     their centers more than `seconds` from the recording ends; PopT uses its 5 s window here, so with seconds = 1 the
-    candidate negatives (and hence the sampled ones) differ from PopT's."""
+    candidate negatives (and hence the sampled ones) differ from PopT's.
+    nonword_nan_rows: a non-word interval must also miss the words dropped for a NaN feature (read_words nan_start,
+    nan_end), which are still speech; False is PopT, which drops them before the overlap check (U34 b).
+    segments: speech negatives only within these (start, stop) stretches (movie_segments, the speech_negatives="movie"
+    variant); onset negatives are not restricted."""
     if task in FEATURE:
         idx, y = quartile_examples(words[FEATURE[task]])
         return words["start"][idx], y
     if task not in ("onset", "speech"):
         raise ValueError(f"unknown task {task!r}; expected one of {TASKS}")
-    neg = nonword_centers(words["start"], words["end"], n_native, int(seconds * fs))
+    s, e = words["start"], words["end"]
+    if nonword_nan_rows and len(words.get("nan_start", ())):
+        s, e = np.concatenate([s, words["nan_start"]]), np.concatenate([e, words["nan_end"]])
+    neg = nonword_centers(s, e, n_native, int(seconds * fs), segments if task == "speech" else None)
     pos = words["start"][words["is_onset"]] if task == "onset" else words["start"]
     n = min(len(pos), len(neg))
     random.seed(42)
@@ -273,7 +313,8 @@ def read_trial(root, subject, trial, task, **kw):
 
 
 def read_trials(root, subject, trial, tasks=TASKS, electrodes="popt", reref="none", notch_hz=(),
-                stat_seconds=None, drop_corrupted=False, cache_dir=None):
+                stat_seconds=None, drop_corrupted=False, cache_dir=None, nonword_nan_rows=True,
+                speech_negatives="recording"):
     """One trial -> {task: list of window dicts {wave float32 (C, 500), channel_ok bool (C,), label 0/1,
     center_seconds, subject, trial, session_id, task, electrodes}}. The signal is read and filtered once for all tasks.
     channel_ok is False for the electrodes not usable in the statistics chunk of the window (usable_channels: flat, or
@@ -283,6 +324,9 @@ def read_trials(root, subject, trial, tasks=TASKS, electrodes="popt", reref="non
     and kept in the cache metadata. reref: "none" (main) or "laplacian" (PopT variant); notch_hz: () (main) or
     NOTCH_HZ (PopT variant). stat_seconds: U4 statistics over chunks of
     this length (by window center) instead of the whole trial; it must match the pretraining unit (SPEC U4).
+    nonword_nan_rows: non-word intervals also miss the words dropped for a NaN feature (True); False is PopT.
+    speech_negatives: "recording" (PopT: the whole recording, pauses and before/after the movie included) or "movie"
+    (only while the movie plays, movie_segments); onset negatives always come from the whole recording.
     cache_dir: keeps each task's arrays as .npy (memory-mapped on reuse) under a name that encodes every argument and
     the code version."""
     root = Path(root)
@@ -290,7 +334,8 @@ def read_trials(root, subject, trial, tasks=TASKS, electrodes="popt", reref="non
     out, todo, names = {}, [], {}
     for task in tasks:
         cfg = {"subject": subject, "trial": trial, "task": task, "electrodes": elecs, "reref": reref,
-               "notch_hz": list(notch_hz or ()), "stat_seconds": stat_seconds, "code": code_version()}
+               "notch_hz": list(notch_hz or ()), "stat_seconds": stat_seconds, "nonword_nan_rows": nonword_nan_rows,
+               "speech_negatives": speech_negatives, "code": code_version()}
         names[task] = (cfg, f"{subject}_{trial}_{task}_{hashlib.md5(json.dumps(cfg).encode()).hexdigest()[:10]}")
         if cache_dir is not None and (Path(cache_dir) / f"{names[task][1]}.json").exists():
             meta = json.loads((Path(cache_dir) / f"{names[task][1]}.json").read_text())
@@ -299,7 +344,8 @@ def read_trials(root, subject, trial, tasks=TASKS, electrodes="popt", reref="non
         else:
             todo.append(task)
     if todo:
-        new = _compute_trial(root, subject, trial, todo, elecs, reref, notch_hz, stat_seconds)
+        new = _compute_trial(root, subject, trial, todo, elecs, reref, notch_hz, stat_seconds, nonword_nan_rows,
+                             speech_negatives)
         for task, (x, y, centers, chunk_of, ok, dropped) in new.items():
             if cache_dir is not None:
                 cfg, name = names[task]
@@ -316,23 +362,27 @@ def read_trials(root, subject, trial, tasks=TASKS, electrodes="popt", reref="non
             for task, (x, y, centers, chunk_of, ok) in ((t, out[t]) for t in tasks)}
 
 
-def _compute_trial(root, subject, trial, tasks, elecs, reref, notch_hz, stat_seconds):
+def _compute_trial(root, subject, trial, tasks, elecs, reref, notch_hz, stat_seconds, nonword_nan_rows=True,
+                   speech_negatives="recording"):
     """-> {task: (x (N, C, 500) float32, labels (N,), centers (N,) native samples, chunk_of (N,), channel_ok (C, K),
     dropped window counts)}, one pass over the electrodes. Prints the electrodes left out of a chunk and the dropped
     windows."""
     import h5py
     if reref not in ("laplacian", "none"):
         raise ValueError(f"reref must be 'laplacian' or 'none', got {reref!r}")
+    if speech_negatives not in ("recording", "movie"):
+        raise ValueError(f"speech_negatives must be 'recording' or 'movie', got {speech_negatives!r}")
     path = root / f"{subject}_{trial}.h5"
     labels = electrode_labels(root, subject)
     with h5py.File(path, "r") as h:
         n_native = h["data"]["electrode_0"].shape[0]
     words = read_words(root, subject, trial)
+    segments = movie_segments(root, subject, trial, n_native) if speech_negatives == "movie" else None
     n500 = int(round(n_native * FS / TB_FS))
     chunks = stat_chunks(n500, None if stat_seconds is None else int(round(stat_seconds * FS)))
     ex = {}
     for task in tasks:
-        centers, y = task_examples(words, n_native, task)
+        centers, y = task_examples(words, n_native, task, nonword_nan_rows=nonword_nan_rows, segments=segments)
         starts = np.round(centers * FS / TB_FS).astype(np.int64) - WINDOW_SAMPLES // 2
         fit = (starts >= 0) & (starts + WINDOW_SAMPLES <= n500)
         starts = starts[fit]
@@ -376,8 +426,10 @@ def split_subject(root, subject, task, mode="heldout", seed=42, **kw):
     heldout (default, the iBrain text: "fine-tuned on a subset of recordings from each subject and evaluated on the
     remaining held-out recordings"): test = the subject's PopT test trial, train = its other trials, val empty.
     Subjects with a single trial (sub_5, sub_8, sub_9) cannot be split this way and raise.
-    popt (the PopT code): only the test trial, its examples split 80/10/10 at random. Same proportions as PopT
-    tasks/utils.py, not the same indices (PopT uses sklearn train_test_split with random_state 42)."""
+    popt (the PopT code): only the test trial, its examples split 80/10/10 as PopT tasks/utils.py get_split_idxs:
+    sklearn train_test_split of the example indices with test_size 0.2, then of the held 20% with test_size 0.5, both
+    with random_state = seed (42 in PopT). The indices are those of PopT when the examples are (windows dropped by
+    read_trials shift them)."""
     if subject not in TEST_TRIALS:
         raise ValueError(f"{subject} has no PopT test trial; subjects: {sorted(TEST_TRIALS)}")
     test_trial = TEST_TRIALS[subject]
@@ -388,10 +440,12 @@ def split_subject(root, subject, task, mode="heldout", seed=42, **kw):
         train = [w for t in others for w in read_trial(root, subject, t, task, **kw)]
         return train, [], read_trial(root, subject, test_trial, task, **kw)
     if mode == "popt":
+        from sklearn.model_selection import train_test_split
         ws = read_trial(root, subject, test_trial, task, **kw)
-        idx = np.random.default_rng(seed).permutation(len(ws))
-        a, b = int(round(0.8 * len(ws))), int(round(0.9 * len(ws)))
-        return [ws[i] for i in idx[:a]], [ws[i] for i in idx[a:b]], [ws[i] for i in idx[b:]]
+        val_split, test_split = 0.1, 0.1  # PopT get_split_idxs arguments
+        tr, held = train_test_split(list(range(len(ws))), test_size=val_split + test_split, random_state=seed)
+        va, te = train_test_split(held, test_size=test_split / (val_split + test_split), random_state=seed)
+        return [ws[i] for i in tr], [ws[i] for i in va], [ws[i] for i in te]
     raise ValueError(f"mode must be 'heldout' or 'popt', got {mode!r}")
 
 

@@ -49,3 +49,6 @@ finetune:
     treebank_popt: {format: treebank, variant: true, root: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/data,
                     split: heldout, cache_dir: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/cache,
                     reref: laplacian, notch_hz: [60, 120, 180, 240, 300, 360]}  # PopT signal condition (U34), only with --dataset treebank_popt
+    treebank_movie_speech: {format: treebank, variant: true, root: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/data,
+                            split: heldout, cache_dir: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/cache,
+                            tasks: [speech], speech_negatives: movie}  # Speech negatives only while the movie plays (U34)

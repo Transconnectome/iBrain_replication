@@ -3,7 +3,7 @@ name = "ibrain-repro"
 version = "0.1.0"
 description = "iBrain (arXiv 2609.06960) replication, spike-first"
 requires-python = ">=3.12"
-dependencies = ["torch", "numpy", "pyyaml", "pynwb", "h5py", "pyarrow", "scipy", "hdf5plugin"]
+dependencies = ["torch", "numpy", "pyyaml", "pynwb", "h5py", "pyarrow", "scipy", "hdf5plugin", "scikit-learn"]
 
 [project.optional-dependencies]
 dev = ["pytest"]

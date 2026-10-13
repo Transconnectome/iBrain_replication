@@ -6,7 +6,8 @@ format and its own options; --dataset picks one or more of them (default: all). 
                test files) are skipped
     treebank   Brain Treebank Pitch / Volume / Onset / Speech per subject (U34, U35): root, split, cache_dir, and
                optionally tasks, subjects and the reader options of data_treebank.read_trials (electrodes, reref,
-               notch_hz, stat_seconds, drop_corrupted). Neural arms × seeds, AUC averaged over subjects
+               notch_hz, stat_seconds, drop_corrupted, nonword_nan_rows, speech_negatives). Neural arms × seeds,
+               AUC averaged over subjects
 An option a format does not know is an error, so a misspelled key cannot be ignored silently. An entry with
 variant: true (e.g. treebank_popt, the PopT signal condition) runs only when --dataset names it.
 Example: python scripts/finetune.py --config configs/paper.yaml --ckpt runs/joint_s0/final.pt --out runs/ft_s0 \\
@@ -81,7 +82,8 @@ def run_nwb(ds, cfg, a, out):
     run_regression(windows, cfg, a, out, {"format": "nwb", "behavior": ds["behavior"], "nwb_files": used})
 
 
-TREEBANK_READER = ("electrodes", "reref", "notch_hz", "stat_seconds", "drop_corrupted", "cache_dir")
+TREEBANK_READER = ("electrodes", "reref", "notch_hz", "stat_seconds", "drop_corrupted", "cache_dir",
+                   "nonword_nan_rows", "speech_negatives")
 
 
 def run_treebank(ds, cfg, a, out):
