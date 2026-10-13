@@ -64,12 +64,14 @@ def ieeg_data(ic, seed, buffer, open_blocks=8, shard=None):
 
 def loader(ds, bs, g, workers, seed=0):
     """bs windows per batch. With several ranks a map-style dataset goes through a DistributedSampler (every rank
-    the same number of batches; pretrain() calls set_epoch at each pass)."""
+    the same number of batches; pretrain() calls set_epoch at each pass). A stream drops each worker's last, partial
+    batch, and so does a DistributedSampler loader: a batch of one window fails the head's BatchNorm (U7), and a rank
+    with a short batch would leave the ranks' shares unequal (seen with 8 ranks, 2026-10-12)."""
     if isinstance(ds, IterableDataset):  # order comes from the stream itself (seeded by the DataLoader base seed)
-        return DataLoader(ds, bs, collate_fn=collate, num_workers=workers)
+        return DataLoader(ds, bs, collate_fn=collate, num_workers=workers, drop_last=True)
     if dist.world() > 1:
         sampler = DistributedSampler(ds, dist.world(), dist.rank(), shuffle=True, seed=seed)
-        return DataLoader(ds, bs, sampler=sampler, collate_fn=collate, num_workers=workers)
+        return DataLoader(ds, bs, sampler=sampler, collate_fn=collate, num_workers=workers, drop_last=True)
     return DataLoader(ds, bs, shuffle=True, collate_fn=collate, generator=g, num_workers=workers)
 
 
@@ -153,6 +155,8 @@ def main():
              resume=a.resume, meta=meta, accum=accum, precision=precision,
              token_budget=pc.get("token_budget"), grad_checkpoint=pc.get("grad_checkpoint", False),
              keep_every=pc.get("keep_every"), use_compile=pc.get("compile", False))
+    dist.finish()
+    dist.finish()
 
 
 if __name__ == "__main__":

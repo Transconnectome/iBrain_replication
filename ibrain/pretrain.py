@@ -2,6 +2,7 @@
 checkpoints and logs (SPEC 1.5, 1.6, U26)."""
 import json
 import math
+import time
 from pathlib import Path
 
 import torch
@@ -136,7 +137,7 @@ def batch_losses(model, x, valid, sig, amp=None, budget=None, scale=1.0, rec_sca
     takes `_bn_align` for L_align, so the head sees the whole batch. Returns the whole-batch L_rec and L_align as
     floats and the batch's `collapse_metrics`. rec_scale (default: scale) scales L_rec's backward on its own: with
     several ranks (U43) it is this rank's share of the step's masked tokens, while L_align, a mean over windows, takes
-    scale = 1 / world."""
+    scale = this rank's share of the step's windows."""
     n = valid.sum(1).cpu()
     masked = (n * x.shape[2] // 2).sum().clamp(min=1)
     device = next(model.parameters()).device
@@ -230,7 +231,7 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
     keep_every: also keep a checkpoint every that many steps as ckpt_<steps done>.pt (not overwritten).
     use_compile: torch.compile the encoders, decoders and backbone blocks (IBrain.compile_parts, U40).
     Several ranks (ibrain.dist, U43): each loader gives this rank's share of a step's windows; L_rec is weighted by
-    the rank's share of the step's masked tokens and L_align by 1 / world, the gradients are summed over the ranks
+    the rank's share of the step's masked tokens and L_align by its share of the windows, the gradients are summed over the ranks
     in one all-reduce before clipping, so the step equals one GPU computing all its windows. Losses and collapse
     metrics are logged for the whole step; only rank 0 writes the log and checkpoints. A pass that ends calls
     set_epoch on the loader's sampler or dataset, so a DistributedSampler or a sharded IEEGStream reshuffles."""
@@ -274,6 +275,7 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
                 f.writelines(json.dumps(h) + "\n" for h in hist)
         log = open(Path(out_dir) / "log.jsonl", "a", encoding="utf-8")
     for t in range(start, steps):
+        t0 = time.perf_counter()
         i = t % len(loaders)
         sig, dl = loaders[i]
         lr = lr_at(t, steps, warmup)
@@ -293,12 +295,13 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
                 batch = next(its[i])
             if W > 1:
                 own = float((batch[1].sum(1) * batch[0].shape[2] // 2).sum())  # masked tokens of this rank (U15)
-                total = max(dist.all_sum([own], device)[0], 1.0)
-                rec, align, m = batch_losses(model, batch[0], batch[1], sig, amp, token_budget, 1 / (accum * W),
-                                             own / total / accum)
+                n_own = float(len(batch[1]))  # windows of this rank
+                total, n_total = (max(v, 1.0) for v in dist.all_sum([own, n_own], device))
+                rec, align, m = batch_losses(model, batch[0], batch[1], sig, amp, token_budget,
+                                             n_own / n_total / accum, own / total / accum)
                 keys = sorted(m)
-                red = dist.all_sum([rec * own, align] + [m[k] for k in keys], device)
-                rec, align, m = red[0] / total, red[1] / W, {k: v / W for k, v in zip(keys, red[2:])}
+                red = dist.all_sum([rec * own, align * n_own] + [m[k] * n_own for k in keys], device)
+                rec, align, m = red[0] / total, red[1] / n_total, {k: v / n_total for k, v in zip(keys, red[2:])}
             else:
                 rec, align, m = batch_losses(model, batch[0], batch[1], sig, amp, token_budget, 1 / accum)
             rec_sum, align_sum = rec_sum + rec, align_sum + align
@@ -306,7 +309,9 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
         dist.sync_grads(model.parameters())
         torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
         opt.step()
-        hist.append({"step": t, "sig": sig, "lr": lr, "rec": rec_sum / accum, "align": align_sum / accum, **mets})
+        # sec: wall time of the step, data wait included (the losses' .item() calls synchronize the GPU)
+        hist.append({"step": t, "sig": sig, "lr": lr, "rec": rec_sum / accum, "align": align_sum / accum, **mets,
+                     "sec": time.perf_counter() - t0})
         if log:
             log.write(json.dumps(hist[-1]) + "\n")
             log.flush()

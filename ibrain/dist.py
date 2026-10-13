@@ -25,8 +25,18 @@ def init():
         os.environ.setdefault("MASTER_PORT", "29500")
         if torch.cuda.is_available():
             torch.cuda.set_device(local)
-        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo", rank=rank, world_size=world)
+            dist.init_process_group("nccl", rank=rank, world_size=world, device_id=torch.device("cuda", local))
+        else:
+            dist.init_process_group("gloo", rank=rank, world_size=world)
     return rank, world, local
+
+
+def finish():
+    """Leave the process group after the last collective (a barrier), so no rank's NCCL watchdog reports the store
+    of an exited rank 0 as a failure."""
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def world():
@@ -44,6 +54,13 @@ def is_main():
 def barrier():
     if world() > 1:
         dist.barrier()
+
+
+def finish():
+    """Leave the process group together, so no rank's NCCL watchdog reports the others' exit as a lost store."""
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def all_sum(values, device):
