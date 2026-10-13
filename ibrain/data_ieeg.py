@@ -271,13 +271,20 @@ class IEEGStream(IterableDataset):
     then go through a shuffle buffer. With open_blocks=1 a batch held one or two blocks (a block is 675 to 900
     windows, about the buffer size). Memory per worker: open_blocks normalized blocks (AJILE12 675 s x ~100
     channels: ~0.14 GB; SWEC 900 s x 128 channels: ~0.23 GB) plus the buffer. The order comes from the DataLoader's
-    base seed, so seed_all makes a run reproducible."""
+    base seed, so seed_all makes a run reproducible.
+    shard=(rank, world, seed) splits the blocks over several ranks (U43): every rank draws the same block order from
+    seed and the pass number (set_epoch), and global worker rank * num_workers + id takes every
+    (world * num_workers)-th block of it, so the ranks' shares are disjoint and cover all blocks."""
 
-    def __init__(self, blocks, buffer=1024, normalize=True, open_blocks=8):
+    def __init__(self, blocks, buffer=1024, normalize=True, open_blocks=8, shard=None):
         if open_blocks < 1:
             raise ValueError(f"open_blocks must be at least 1, got {open_blocks}")
         self.blocks, self.buffer, self.normalize, self.open_blocks = list(blocks), buffer, normalize, open_blocks
+        self.shard, self.epoch = shard, 0
         self.hours = sum((b.stop - b.start) / b.fs for b in self.blocks) / 3600
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
     def _windows(self, b):
         """Windows of one block. Reads the block at the first draw, so only open blocks are held in memory."""
@@ -289,11 +296,18 @@ class IEEGStream(IterableDataset):
 
     def __iter__(self):
         info = get_worker_info()
-        base = (info.seed - info.id) if info else int(torch.randint(0, 2 ** 62, (1,)))
-        order = np.random.default_rng(base).permutation(len(self.blocks))
-        if info:
-            order = order[info.id::info.num_workers]
-        rng = np.random.default_rng(base + (info.id if info else 0) + 1)
+        if self.shard is not None:
+            rank, world, seed = self.shard
+            wid, nw = (info.id, info.num_workers) if info else (0, 1)
+            order = np.random.default_rng([seed, self.epoch]).permutation(len(self.blocks))
+            order = order[rank * nw + wid::world * nw]
+            rng = np.random.default_rng([seed, self.epoch, rank, wid, 1])
+        else:
+            base = (info.seed - info.id) if info else int(torch.randint(0, 2 ** 62, (1,)))
+            order = np.random.default_rng(base).permutation(len(self.blocks))
+            if info:
+                order = order[info.id::info.num_workers]
+            rng = np.random.default_rng(base + (info.id if info else 0) + 1)
         todo = iter(order)
         active = []
         buf = []

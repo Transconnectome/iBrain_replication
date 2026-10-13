@@ -6,8 +6,9 @@ from pathlib import Path
 
 import torch
 
+from ibrain import dist
 from ibrain.model import SPIKE, masked_mse, masked_poisson_nll, simsiam_loss
-from ibrain.repro import load_checkpoint, save_checkpoint, set_rng_state
+from ibrain.repro import load_checkpoint, save_checkpoint, seed_all, set_rng_state
 
 LR, LR_MIN, WD, CLIP = 5e-4, 1e-5, 5e-2, 1.0  # SPEC 1.6
 PRECISION = {"fp32": None, "bf16": torch.bfloat16}  # autocast dtype of the model forward (U36)
@@ -126,18 +127,21 @@ def pack(n_units, budget=None):
     return [torch.tensor(c) for c in out]
 
 
-def batch_losses(model, x, valid, sig, amp=None, budget=None, scale=1.0):
+def batch_losses(model, x, valid, sig, amp=None, budget=None, scale=1.0, rec_scale=None):
     """Losses of one loader batch computed in micro-batches from `pack`, with backward on each (scaled by `scale`).
     Each micro-batch is cut to its own largest window, so little compute goes to padding. The micro-batch losses are
     weighted so that the gradient equals that of the whole batch at once: L_rec is a mean over masked tokens (each
     window masks exactly n_units * S // 2, U15), so a micro-batch weighs by its share of masked tokens; L_align is a
     mean over windows, so it weighs by its share of windows. A model with BatchNorm in the SimSiam head (head_bn)
     takes `_bn_align` for L_align, so the head sees the whole batch. Returns the whole-batch L_rec and L_align as
-    floats and the batch's `collapse_metrics`."""
+    floats and the batch's `collapse_metrics`. rec_scale (default: scale) scales L_rec's backward on its own: with
+    several ranks (U43) it is this rank's share of the step's masked tokens, while L_align, a mean over windows, takes
+    scale = 1 / world."""
     n = valid.sum(1).cpu()
     masked = (n * x.shape[2] // 2).sum().clamp(min=1)
     device = next(model.parameters()).device
     rec_b = align_b = 0.0
+    rs = scale if rec_scale is None else rec_scale
     parts = []
     for idx in pack(n, budget):
         c = int(n[idx].max())
@@ -145,11 +149,11 @@ def batch_losses(model, x, valid, sig, amp=None, budget=None, scale=1.0):
         w_rec = float((n[idx] * x.shape[2] // 2).sum() / masked)
         if model.head_bn:
             rec = rec_loss(model, xc, vc, sig, amp)
-            (w_rec * rec * scale).backward()
+            (w_rec * rec * rs).backward()
         else:
             w_align = len(idx) / len(n)
             rec, align, part = step_losses(model, xc, vc, sig, amp, return_parts=True)
-            ((w_rec * rec + w_align * align) * scale).backward()
+            (w_rec * rec * rs + w_align * align * scale).backward()
             align_b += w_align * align.item()
             parts.append((idx, part))
         rec_b += w_rec * rec.item()
@@ -224,11 +228,18 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
     precision: "fp32" or "bf16" (autocast of the model forward, weights and optimizer stay float32, U36).
     grad_checkpoint: activation checkpointing of the encoder and backbone blocks (U37).
     keep_every: also keep a checkpoint every that many steps as ckpt_<steps done>.pt (not overwritten).
-    use_compile: torch.compile the encoders, decoders and backbone blocks (IBrain.compile_parts, U40)."""
+    use_compile: torch.compile the encoders, decoders and backbone blocks (IBrain.compile_parts, U40).
+    Several ranks (ibrain.dist, U43): each loader gives this rank's share of a step's windows; L_rec is weighted by
+    the rank's share of the step's masked tokens and L_align by 1 / world, the gradients are summed over the ranks
+    in one all-reduce before clipping, so the step equals one GPU computing all its windows. Losses and collapse
+    metrics are logged for the whole step; only rank 0 writes the log and checkpoints. A pass that ends calls
+    set_epoch on the loader's sampler or dataset, so a DistributedSampler or a sharded IEEGStream reshuffles."""
     if precision not in PRECISION:
         raise ValueError(f"precision must be one of {sorted(PRECISION)}, got {precision!r}")
     amp = PRECISION[precision]
+    W = dist.world()
     model.to(device).train()
+    dist.broadcast_model(model)
     model.grad_checkpoint = grad_checkpoint
     if use_compile:
         model.compile_parts()
@@ -240,10 +251,27 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
         opt.load_state_dict(ck["opt"])
         start, hist = ck["step"] + 1, ck["hist"]
         set_rng_state(ck["rng"])
+        if W > 1:  # the checkpoint holds rank 0's RNG state: give each rank its own stream again
+            seed_all(1_000_003 * start + dist.rank())
+    passes = [0] * len(loaders)
+    if resume:  # U26 (e): a new order after a resume. Without this the loaders would restart pass 0's order, the
+        # sampler's generator and the pass counter being rebuilt from the run seed, so every resume of a chunked run
+        # would show the start of the same permutation again
+        for i, (_, dl) in enumerate(loaders):
+            passes[i] = start  # pass numbers of this segment start at the resume step: none repeats an earlier one
+            for src in (getattr(dl, "sampler", None), dl.dataset):
+                if hasattr(src, "set_epoch"):
+                    src.set_epoch(passes[i])
+            gen = getattr(getattr(dl, "sampler", None), "generator", None)
+            if gen is not None:  # one-GPU RandomSampler: reseed from the restored RNG state
+                gen.manual_seed(int(torch.randint(0, 2 ** 62, (1,))))
     its = [iter(dl) for _, dl in loaders]
     log = None
-    if out_dir:
+    if out_dir and dist.is_main():
         Path(out_dir).mkdir(parents=True, exist_ok=True)
+        if resume:  # the log ends at the checkpoint: steps logged after it (an interrupted or preempted job) rerun now
+            with open(Path(out_dir) / "log.jsonl", "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(h) + "\n" for h in hist)
         log = open(Path(out_dir) / "log.jsonl", "a", encoding="utf-8")
     for t in range(start, steps):
         i = t % len(loaders)
@@ -257,25 +285,40 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
         for _ in range(accum):
             batch = next(its[i], None)
             if batch is None:  # end of a pass, reshuffle and cycle (U20)
+                passes[i] += 1
+                for src in (getattr(dl, "sampler", None), dl.dataset):
+                    if hasattr(src, "set_epoch"):
+                        src.set_epoch(passes[i])
                 its[i] = iter(dl)
                 batch = next(its[i])
-            rec, align, m = batch_losses(model, batch[0], batch[1], sig, amp, token_budget, 1 / accum)
+            if W > 1:
+                own = float((batch[1].sum(1) * batch[0].shape[2] // 2).sum())  # masked tokens of this rank (U15)
+                total = max(dist.all_sum([own], device)[0], 1.0)
+                rec, align, m = batch_losses(model, batch[0], batch[1], sig, amp, token_budget, 1 / (accum * W),
+                                             own / total / accum)
+                keys = sorted(m)
+                red = dist.all_sum([rec * own, align] + [m[k] for k in keys], device)
+                rec, align, m = red[0] / total, red[1] / W, {k: v / W for k, v in zip(keys, red[2:])}
+            else:
+                rec, align, m = batch_losses(model, batch[0], batch[1], sig, amp, token_budget, 1 / accum)
             rec_sum, align_sum = rec_sum + rec, align_sum + align
             mets = {k: mets.get(k, 0.0) + v / accum for k, v in m.items()}
+        dist.sync_grads(model.parameters())
         torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
         opt.step()
         hist.append({"step": t, "sig": sig, "lr": lr, "rec": rec_sum / accum, "align": align_sum / accum, **mets})
         if log:
             log.write(json.dumps(hist[-1]) + "\n")
             log.flush()
-        if t % 100 == 0:
+        if t % 100 == 0 and dist.is_main():
             gpu = f" gpu_peak={torch.cuda.max_memory_allocated() / 2 ** 30:.1f}GiB" if torch.device(device).type == "cuda" else ""
             print(f"{hist[-1]}{gpu}")
-        if out_dir and ((t + 1) % ckpt_every == 0 or t == steps - 1):
+        if out_dir and dist.is_main() and ((t + 1) % ckpt_every == 0 or t == steps - 1):
             save_checkpoint(Path(out_dir) / "ckpt.pt", model, opt, t, hist, meta)
-        if out_dir and keep_every and (t + 1) % keep_every == 0:
+        if out_dir and dist.is_main() and keep_every and (t + 1) % keep_every == 0:
             save_checkpoint(Path(out_dir) / f"ckpt_{t + 1:07d}.pt", model, opt, t, hist, meta)
-    if out_dir:
+    if out_dir and dist.is_main():
         save_checkpoint(Path(out_dir) / "final.pt", model, opt, steps - 1, hist, meta)
         log.close()
+    dist.barrier()  # no rank leaves before rank 0 has written final.pt
     return hist

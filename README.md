@@ -98,6 +98,13 @@ For iEEG pilots, `--ieeg-only` is the counterpart of `--spike-only`: every step 
 sbatch scripts/slurm/pretrain.sbatch <config> 0 runs/ieeg_s0 --ieeg-only
 ```
 
+On several GPUs (whole Perlmutter nodes, 4 A100 each), `scripts/slurm/pretrain_ddp.sbatch` takes the same arguments and starts one rank per GPU with srun; each rank computes its share of a step's 256 windows and the gradients are summed once per step (SPEC U43):
+
+```bash
+sbatch scripts/slurm/pretrain_ddp.sbatch configs/paper.yaml 0 runs/joint_s0        # 4 GPUs
+sbatch -N 2 scripts/slurm/pretrain_ddp.sbatch configs/paper.yaml 0 runs/joint_s0   # 8 GPUs, as the paper
+```
+
 ### Brain Treebank
 The `treebank` entry builds the Pitch, Volume, Onset and Speech examples of the [Brain Treebank](https://braintreebank.dev) with the PopT rules, cut to 1 s windows at 500 Hz (SPEC U34). Each of the 7 subjects with more than one trial is fine-tuned on its other trials and tested on its held-out PopT trial. The model encodes with the iEEG encoder and iEEG type embedding of pretraining, the head gives one logit per window, and the score is AUC averaged over subjects (SPEC U35). Only the three neural arms run; there is no linear baseline. With `cache_dir`, every trial is read and filtered once for all four tasks.
 
