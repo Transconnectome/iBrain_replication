@@ -56,13 +56,6 @@ def barrier():
         dist.barrier()
 
 
-def finish():
-    """Leave the process group together, so no rank's NCCL watchdog reports the others' exit as a lost store."""
-    if dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
-
 def all_sum(values, device):
     """Floats summed over the ranks (float64, so counts stay exact)."""
     if world() == 1:

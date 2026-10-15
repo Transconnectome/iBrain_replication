@@ -25,7 +25,11 @@
 #SBATCH --error=./logs/%x_%j.err
 set -euo pipefail
 
-PROJECT=/pscratch/sd/z/zres0710/iBrain_replication
+# IBRAIN_CODE: the code to run, e.g. a git worktree frozen at one commit for a long requeued run, so edits to the main
+# checkout never reach a resumed segment (sbatch --export=ALL,IBRAIN_CODE=<worktree>). The venv stays the main
+# checkout's; scripts put their own repo root first on sys.path, so `ibrain` comes from IBRAIN_CODE.
+PROJECT=${IBRAIN_CODE:-/pscratch/sd/z/zres0710/iBrain_replication}
+VENV=${IBRAIN_VENV:-/pscratch/sd/z/zres0710/iBrain_replication/.venv}
 cd "$PROJECT"
 mkdir -p logs
 
@@ -34,7 +38,7 @@ SEED=${2:-0}
 OUT=${3:-runs/paper_ddp_s${SEED}}
 EXTRA=("${@:4}")
 
-source .venv/bin/activate
+source "$VENV/bin/activate"
 # Across nodes NCCL needs the Slingshot (libfabric) plugin of NERSC's module; one node uses NVLink without it
 if [ "${SLURM_JOB_NUM_NODES:-1}" -gt 1 ]; then module load nccl/2.29.2-cu13; fi
 export HDF5_USE_FILE_LOCKING=FALSE

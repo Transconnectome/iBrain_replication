@@ -11,6 +11,7 @@ pretrain:
   grad_checkpoint: false  # activation checkpointing (U37); true if the token_budget check fails
   compile: true        # U40: torch.compile of encoders, decoders and backbone blocks (GPU)
   ckpt_every: 1000
+  keep_every: 47420    # one snapshot per epoch (spike + iEEG batches per epoch with 4 ranks: 2 x 23,710)
   num_workers: 4
   shuffle_buffer: 1024   # iEEG windows held per worker for shuffling (about 0.25 GB at 124 channels)
   open_blocks: 8         # iEEG blocks each DataLoader worker mixes at once; a batch comes from one worker (U41)
