@@ -156,7 +156,6 @@ def main():
              token_budget=pc.get("token_budget"), grad_checkpoint=pc.get("grad_checkpoint", False),
              keep_every=pc.get("keep_every"), use_compile=pc.get("compile", False))
     dist.finish()
-    dist.finish()
 
 
 if __name__ == "__main__":
