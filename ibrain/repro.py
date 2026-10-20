@@ -13,7 +13,7 @@ import torch
 
 def seed_all(seed):
     random.seed(seed)
-    np.random.seed(seed)
+    np.random.seed(seed % 2**32)  # numpy takes only 32 bits; a resume reseeds with 1_000_003 * step + rank
     torch.manual_seed(seed)  # seeds CUDA / MPS generators too
 
 
@@ -48,7 +48,9 @@ def set_rng_state(st):
     np.random.set_state(st["numpy"])
     random.setstate(st["python"])
     if "cuda" in st and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all([s.cpu() for s in st["cuda"]])
+        # a checkpoint saved where more GPUs were visible restores only the visible ones
+        for i, s in enumerate(st["cuda"][:torch.cuda.device_count()]):
+            torch.cuda.set_rng_state(s.cpu(), i)
 
 
 def save_checkpoint(path, model, opt, step, hist, meta):
