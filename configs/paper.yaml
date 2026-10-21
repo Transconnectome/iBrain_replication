@@ -37,7 +37,14 @@ finetune:
   wd: 5.0e-2
   batch_size: 32
   split_seed: 0        # fixed trial 80/20 split (M4). Independent of the run seed
-  seeds: [0, 1, 2]     # U12
+  seeds: [0, 1, 2]     # U12; the full protocol (U44)
+  precision: bf16      # autocast of the model forward, as in pretraining (U36)
+  num_workers: 4
+  cache_gib: 12        # frozen arm: encode once and train the head on cached features when they fit (U44)
+  probe:               # U44: intermediate pretraining checkpoints, one seed and three Brain Treebank subjects
+    epochs: [1, 2, 4, 8, 16, 30]   # snapshots ckpt_<epoch x 47420>.pt (log spacing; 30 = final.pt)
+    seeds: [0]
+    subjects: [sub_3, sub_4, sub_6]  # two training trials each, the fewest windows (U34 counts)
   datasets:            # scripts/finetune.py --dataset <name ...> (default: all). Folders checked on the server 2026-10-03
     mc_maze:    {format: nwb, root: /pscratch/sd/z/zres0710/iBrain/downstream/spikes/MC_Maze/000128, behavior: hand_vel}
     area2_bump: {format: nwb, root: /pscratch/sd/z/zres0710/iBrain/downstream/spikes/Area2_bump/000127, behavior: hand_vel}
