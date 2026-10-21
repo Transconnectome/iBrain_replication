@@ -459,6 +459,9 @@ class TreebankWindows(Dataset):
     def __len__(self):
         return len(self.w)
 
+    def channels(self):
+        return [w["wave"].shape[0] for w in self.w]
+
     def __getitem__(self, i):
         w = self.w[i]
         x = to_patches(w["wave"])

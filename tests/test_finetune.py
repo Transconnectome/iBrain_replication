@@ -16,8 +16,9 @@ from ibrain.data_ieeg import SyntheticIEEG
 from ibrain.data_nwb import attach_velocity, patch_labels
 from ibrain.data_spike import SYNTHETIC, SpikeWindows, collate, read_windows, write_synthetic
 from ibrain.data_treebank import TreebankWindows, collate_treebank, read_trial
-from ibrain.finetune import (HEADS, AttnPoolHead, Regressor, WindowLogit, auc, fit_arm, fit_classifier_arm,
-                             ieeg_steps, r2, ridge_r2, split_trials, synthetic_labeled, train_regressor)
+from ibrain.finetune import (HEADS, AttnPoolHead, LabeledWindows, Regressor, WindowLogit, auc, collate_labeled,
+                             fit_arm, fit_classifier_arm, ieeg_steps, load_downstream, predict, r2, ridge_r2,
+                             split_trials, synthetic_labeled, train_regressor)
 from ibrain.model import IEEG, SPIKE, IBrain
 from ibrain.pretrain import pretrain
 from ibrain.repro import load_checkpoint
@@ -198,9 +199,48 @@ def test_classifier_learns_synthetic_treebank(tmp_path):
     assert fit_classifier_arm(train, test, TINY, seed=0, epochs=15, lr=1e-3)[0] == score  # U26
 
 
+def test_fit_saves_and_reloads(tmp_path):
+    """U44: a fit with out saves the parameters it trained (not the untouched ones), predictions and score, and
+    load_downstream rebuilds a model with the same predictions. Finetune from a joint checkpoint on spike regression."""
+    ckpt = joint_checkpoint(tmp_path)
+    train, test = split_trials(synthetic_labeled(40, 8, seed=0), 0.8, 0)
+    out = tmp_path / "ft"
+    score, _ = fit_arm(train, test, TINY, seed=1, ckpt=ckpt, epochs=2, lr=1e-3, out=out)
+    d = torch.load(out / "params.pt", weights_only=False)
+    assert d["arm"] == "finetune" and d["ckpt"]["path"] == str(ckpt) and len(d["ckpt"]["sha256"]) == 64
+    assert {"model.time_emb", "model.type_emb.0"} <= set(d["params"])
+    assert all(k.startswith(("model.enc.0.", "model.type_emb.0", "model.time_emb", "model.backbone.", "head."))
+               for k in d["params"]), sorted(d["params"])
+    reg, _ = load_downstream(out / "params.pt")
+    mu, sd = np.array(d["label_norm"]["mu"]), np.array(d["label_norm"]["sd"])
+    pred, _ = predict(reg, DataLoader(LabeledWindows(test, mu, sd), 8, collate_fn=collate_labeled))
+    assert np.allclose(pred.numpy() * sd + mu, np.load(out / "preds.npz")["pred"], atol=1e-5)
+    assert json.loads((out / "result.json").read_text())["score"] == pytest.approx(score)
+
+
+def test_frozen_cached_features_match_direct(tmp_path):
+    """U44: the frozen arm on cached features gives the head training of the direct forward (same loss history and
+    AUC) with windows of different channel counts, saves the head only, and reloads."""
+    ckpt = joint_checkpoint(tmp_path)
+    rng = np.random.default_rng(0)
+    ws = [{"wave": rng.normal(0, 1, (5 - i % 2, 500)).astype(np.float32), "label": i % 2} for i in range(24)]
+    tr, te = ws[:16], ws[16:]
+    out = tmp_path / "frozen"
+    s_cache, h_cache = fit_classifier_arm(tr, te, TINY, seed=0, ckpt=ckpt, frozen=True, epochs=3, lr=1e-2, out=out)
+    s_direct, h_direct = fit_classifier_arm(tr, te, TINY, seed=0, ckpt=ckpt, frozen=True, epochs=3, lr=1e-2,
+                                            cache_gib=0)
+    assert s_cache == pytest.approx(s_direct, abs=1e-6) and np.allclose(h_cache, h_direct, atol=1e-5)
+    d = torch.load(out / "params.pt", weights_only=False)
+    assert d["arm"] == "finetune_frozen" and all(k.startswith("head.") for k in d["params"])
+    clf, _ = load_downstream(out / "params.pt")
+    logits, _ = predict(clf, DataLoader(TreebankWindows(te), 8, collate_fn=collate_treebank))
+    assert np.allclose(logits.numpy(), np.load(out / "preds.npz")["pred"], atol=1e-5)
+
+
 def test_finetune_script_on_treebank(tmp_path):
     """scripts/finetune.py --dataset on a synthetic Brain Treebank with a joint checkpoint: three neural arms, no
-    ridge, per-subject AUC and the subject mean per seed."""
+    ridge, one unit directory per (arm, seed) with its saved fit (U44); a rerun skips every unit; the summary script
+    tabulates them."""
     ckpt = joint_checkpoint(tmp_path)
     write_treebank(tmp_path / "tb")
     cfg = yaml.safe_load((ROOT / "configs/tiny.yaml").read_text())
@@ -210,27 +250,34 @@ def test_finetune_script_on_treebank(tmp_path):
                                          "tasks": ["speech"], "subjects": ["sub_1"], "stat_seconds": 30,
                                          "notch_hz": [60], "cache_dir": str(tmp_path / "cache")}
     (tmp_path / "cfg.yaml").write_text(yaml.safe_dump(cfg))
-    out = tmp_path / "ft"
-    r = subprocess.run([sys.executable, str(ROOT / "scripts/finetune.py"), "--config", str(tmp_path / "cfg.yaml"),
-                        "--ckpt", str(ckpt), "--out", str(out), "--dataset", "tb", "--device", "cpu"],
-                       capture_output=True, text=True, cwd=ROOT)
+    root = tmp_path / "ds"
+    out = root / "step_0000003"
+    cmd = [sys.executable, str(ROOT / "scripts/finetune.py"), "--config", str(tmp_path / "cfg.yaml"),
+           "--ckpt", str(ckpt), "--out", str(out), "--dataset", "tb", "--device", "cpu"]
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     print("\n" + r.stdout[-600:])
     assert r.returncode == 0, r.stderr[-2000:]
     assert "WARNING" not in r.stdout
-    res = json.loads((out / "tb" / "results.json").read_text())
-    meta = json.loads((out / "tb" / "meta.json").read_text())
-    assert meta["ckpt_ieeg_steps"] == 3 and meta["split"] == "heldout"
-    arms = res["tasks"]["speech"]["arms"]
-    assert set(arms) == {"finetune", "finetune_frozen", "scratch"}
-    sub = res["tasks"]["speech"]["subjects"]["sub_1"]
-    for name, v in arms.items():
-        assert v["auc_by_seed"] == sub["arms"][name]["auc"]  # one subject: the subject mean is that subject
-        assert all(0.0 <= s <= 1.0 for s in v["auc_by_seed"]) and len(v["auc_by_seed"]) == 2
+    assert json.loads((out / "tb" / "meta.json").read_text())["split"] == "heldout"
+    arms = ("finetune", "finetune_frozen", "scratch")
+    for arm in arms:
+        for seed in (0, 1):
+            unit = out / "tb" / "speech" / "sub_1" / arm / f"seed{seed}"
+            res = json.loads((unit / "result.json").read_text())
+            assert res["metric"] == "auc" and 0.0 <= res["score"] <= 1.0 and res["seed"] == seed
+            assert (unit / "params.pt").exists() and (unit / "preds.npz").exists()
     assert len(list((tmp_path / "cache").glob("*.npy"))) == 2  # both trials cached once for the task
-    assert res["complete"] and all(v["n_subjects"] == 1 for v in arms.values())
     for f in (tmp_path / "cache").glob("*.json"):  # the reader options reach the reader
         c = json.loads(f.read_text())
         assert c["stat_seconds"] == 30 and c["notch_hz"] == [60]
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0 and r.stdout.count("skip ") == 6, r.stdout[-600:]
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/downstream_summary.py"), "--root", str(root)],
+                       capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr[-2000:]
+    md = (root / "summary" / "table.md").read_text()
+    assert "### tb / speech (auc)" in md and "| step 3 |" in md and all(f"| {a} |" in md for a in arms), md
+    assert "(n=2)" in md and "subjects in the mean: ['sub_1']" in md
 
 
 def test_finetune_script_rejects_unknown_option(tmp_path):

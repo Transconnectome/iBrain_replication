@@ -113,8 +113,9 @@ def test_finetune_script_on_nwb_folder(tmp_path):
     assert r.returncode == 0, r.stderr[-2000:]
     assert "skip sub-X_ses-0_desc-test.nwb" in r.stdout and "sessions=2" in r.stdout
     assert not (out / "synthetic").exists()  # only the dataset that was asked for
-    res = json.loads((out / "nlb" / "results.json").read_text())
+    ridge = json.loads((out / "nlb" / "ridge" / "result.json").read_text())
+    scratch = json.loads((out / "nlb" / "scratch" / "seed0" / "result.json").read_text())
     meta = json.loads((out / "nlb" / "meta.json").read_text())
     assert len(meta["nwb_files"]) == 2 and meta["behavior"] == "hand_vel"
     # ridge well above 0 means labels line up with spikes (misaligned labels give R² near 0); scratch just learns
-    assert res["arms"]["ridge"]["mean"] > 0.3 and res["arms"]["scratch"]["mean"] > 0.0
+    assert ridge["score"] > 0.3 and scratch["score"] > 0.0

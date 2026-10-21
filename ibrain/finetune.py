@@ -5,7 +5,14 @@ Labels are the mean behavior (velocity) per 100 ms patch of the window, (S, 2) (
 with train-set statistics before training (U27). Reading NWB files and attaching labels is in data_nwb.
 M5 downstream: Brain Treebank binary classification scored by AUC (U35). The same model, heads and training loop,
 with sig = IEEG so the iEEG encoder and type embedding of pretraining are used, one logit per window and
-BCE loss. Reading the windows is in data_treebank."""
+BCE loss. Reading the windows is in data_treebank.
+U44: a fit can save what it trained (params.pt: the parameters that received a gradient, the head description and
+the label statistics), its test predictions and its score, apart from the pretraining checkpoint it started from;
+load_downstream rebuilds the fitted model. The frozen arm encodes every window once and trains the head on the
+cached features (the backbone is in eval mode without gradient, so its output is fixed)."""
+import hashlib
+import time
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,7 +22,9 @@ from torch.utils.data import DataLoader, Dataset
 from ibrain.data_spike import P, S, collate, to_patches
 from ibrain.data_treebank import TreebankWindows, collate_treebank
 from ibrain.model import IEEG, SPIKE, IBrain
-from ibrain.repro import load_checkpoint, seed_all
+from ibrain.repro import git_hash, load_checkpoint, seed_all, write_json
+
+PRECISION = {"fp32": None, "bf16": torch.bfloat16}  # autocast dtype of the model forward, as in pretraining (U36)
 
 
 # ---------------- Labels and splits ----------------
@@ -59,6 +68,9 @@ class LabeledWindows(Dataset):
 
     def __len__(self):
         return len(self.w)
+
+    def channels(self):
+        return [w["counts"].shape[1] for w in self.w]
 
     def __getitem__(self, i):
         y = (np.asarray(self.w[i]["vel"], dtype=np.float64) - self.mu) / self.sd
@@ -137,6 +149,7 @@ class Regressor(nn.Module):
     def __init__(self, model, head, frozen=False, sig=SPIKE):
         super().__init__()
         self.model, self.head, self.frozen, self.sig = model, head, frozen, sig
+        self.d = model.time_emb.shape[-1]
         if frozen:
             model.requires_grad_(False)
 
@@ -164,9 +177,13 @@ def r2(pred, y):
     return float((1 - ss_res / ss_tot).mean())
 
 
-def train_regressor(reg, dl, epochs, lr=1e-4, wd=5e-2, device="cpu", loss_fn=F.mse_loss):
+def _autocast(device, amp):
+    return torch.autocast(torch.device(device).type, dtype=amp or torch.bfloat16, enabled=amp is not None)
+
+
+def train_regressor(reg, dl, epochs, lr=1e-4, wd=5e-2, device="cpu", loss_fn=F.mse_loss, amp=None):
     """AdamW, clip 1.0, constant lr (U27). loss_fn: MSE for regression, BCE with logits for classification (U35).
-    Returns the mean loss per epoch."""
+    amp: autocast dtype of the forward (U36); the loss is computed in float32. Returns the mean loss per epoch."""
     reg.to(device).train()
     opt = torch.optim.AdamW([p for p in reg.parameters() if p.requires_grad], lr=lr, weight_decay=wd)
     hist = []
@@ -174,7 +191,9 @@ def train_regressor(reg, dl, epochs, lr=1e-4, wd=5e-2, device="cpu", loss_fn=F.m
         tot, n = 0.0, 0
         for x, valid, y in dl:
             x, valid, y = x.to(device), valid.to(device), y.to(device)
-            loss = loss_fn(reg(x, valid), y)
+            with _autocast(device, amp):
+                out = reg(x, valid)
+            loss = loss_fn(out.float(), y)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(reg.parameters(), 1.0)
@@ -185,19 +204,159 @@ def train_regressor(reg, dl, epochs, lr=1e-4, wd=5e-2, device="cpu", loss_fn=F.m
 
 
 @torch.no_grad()
-def evaluate(reg, dl, device="cpu"):
+def predict(reg, dl, device="cpu", amp=None):
+    """-> (prediction, target) float32 CPU tensors over the whole loader, in loader order."""
     reg.eval()
     preds, ys = [], []
     for x, valid, y in dl:
-        preds.append(reg(x.to(device), valid.to(device)).cpu())
+        with _autocast(device, amp):
+            out = reg(x.to(device), valid.to(device))
+        preds.append(out.float().cpu())
         ys.append(y)
-    D = ys[0].shape[-1]
-    return r2(torch.cat(preds).reshape(-1, D), torch.cat(ys).reshape(-1, D))
+    return torch.cat(preds), torch.cat(ys)
+
+
+def evaluate(reg, dl, device="cpu", amp=None):
+    pred, y = predict(reg, dl, device, amp)
+    D = y.shape[-1]
+    return r2(pred.reshape(-1, D), y.reshape(-1, D))
+
+
+# ---------------- Frozen arm: cached features (U44) ----------------
+
+class FeatureWindows(Dataset):
+    """Encoded windows (u (C_i, S, d), valid (C_i,), y) of the frozen arm, each with its own channel count."""
+
+    def __init__(self, items):
+        self.items = items
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        return self.items[i]
+
+
+def collate_features(batch):
+    u = nn.utils.rnn.pad_sequence([b[0] for b in batch], batch_first=True)  # (B, C, S, d), 0 on padded channels
+    valid = nn.utils.rnn.pad_sequence([b[1] for b in batch], batch_first=True)
+    return u, valid, torch.stack([b[2] for b in batch])
+
+
+class HeadOnly(nn.Module):
+    """The head of a Regressor applied to cached features: parameters, train() and eval() are the Regressor's."""
+
+    def __init__(self, reg):
+        super().__init__()
+        self.reg = reg
+
+    def forward(self, u, valid):
+        return self.reg.head(u, valid)
+
+
+@torch.no_grad()
+def encode_windows(reg, ds, collate_fn, batch_size, device, amp, num_workers=0):
+    """Every window of ds through the frozen model once -> FeatureWindows. Features are kept in the autocast dtype
+    (the head's matmuls see them in that dtype anyway), unpadded to each window's own channels, on the CPU."""
+    reg.to(device).eval()
+    items, chans = [], ds.channels()  # the loader keeps the dataset order, so chans[k] is window k's own C
+    for x, valid, y in DataLoader(ds, batch_size, collate_fn=collate_fn, num_workers=num_workers):
+        with _autocast(device, amp):
+            u = reg.model.encode(x.to(device), valid.to(device), reg.sig)
+        u = u.to(amp or torch.float32).cpu()
+        for i in range(len(x)):
+            C = chans[len(items)]
+            items.append((u[i, :C].clone(), valid[i, :C].clone(), y[i]))
+    return FeatureWindows(items)
+
+
+def feature_bytes(ds, d, amp):
+    return sum(ds.channels()) * S * d * (torch.finfo(amp).bits // 8 if amp else 4)
+
+
+def _fit(reg, ds_tr, ds_te, collate_fn, seed, epochs, lr, wd, batch_size, device, amp, num_workers, cache_gib,
+         loss_fn):
+    """Train reg on ds_tr and predict ds_te. The frozen arm trains the head on cached features when they fit in
+    cache_gib of memory (same windows, same shuffling, same head; only the backbone forward is done once)."""
+    g = torch.Generator().manual_seed(seed)
+    net = reg
+    if reg.frozen and cache_gib and feature_bytes(ds_tr, reg.d, amp) + feature_bytes(ds_te, reg.d, amp) <= cache_gib * 2 ** 30:
+        ds_tr = encode_windows(reg, ds_tr, collate_fn, batch_size, device, amp, num_workers)
+        ds_te = encode_windows(reg, ds_te, collate_fn, batch_size, device, amp, num_workers)
+        collate_fn, net, num_workers = collate_features, HeadOnly(reg), 0
+    dl_tr = DataLoader(ds_tr, batch_size, shuffle=True, collate_fn=collate_fn, generator=g, num_workers=num_workers)
+    dl_te = DataLoader(ds_te, batch_size, collate_fn=collate_fn, num_workers=num_workers)
+    hist = train_regressor(net, dl_tr, epochs, lr, wd, device, loss_fn, amp)
+    pred, y = predict(net, dl_te, device, amp)
+    return hist, pred, y
+
+
+# ---------------- Saving what a fit trained (U44) ----------------
+
+def trained_state(reg):
+    """Parameters that received a gradient in training: the finetune arm's encoder, type embedding, time embedding
+    and backbone of its signal type plus the head; the frozen arm's head only. The other signal type's encoder, the
+    decoders and the SimSiam head never get a gradient (U24) and are not saved."""
+    return {n: p.detach().cpu().clone() for n, p in reg.named_parameters() if p.grad is not None}
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def ckpt_info(ckpt):
+    """Path, step and hash of the pretraining checkpoint a fit started from (None for the scratch arm)."""
+    if not ckpt:
+        return None
+    return {"path": str(ckpt), "step": load_checkpoint(ckpt)["step"], "sha256": sha256(ckpt)}
+
+
+def save_fit(out, reg, head_spec, result, pred, y, extra):
+    """out/params.pt (trained parameters + everything load_downstream needs), preds.npz, result.json."""
+    out.mkdir(parents=True, exist_ok=True)
+    torch.save({"params": trained_state(reg), "head": head_spec, "sig": reg.sig, "frozen": reg.frozen, **extra},
+               out / "params.pt")
+    np.savez(out / "preds.npz", pred=pred.numpy(), y=y.numpy())
+    write_json(out / "result.json", result)
+
+
+def load_downstream(path, device="cpu", ckpt=None):
+    """params.pt -> (Regressor as at the end of its fit, the saved dict). The model is rebuilt from the saved config
+    and seed, the pretraining checkpoint is loaded from the saved path (or ckpt), then the trained parameters."""
+    d = torch.load(path, map_location="cpu", weights_only=False)
+    seed_all(d["seed"])
+    model = IBrain(**d["model_cfg"])
+    src = ckpt or (d["ckpt"] or {}).get("path")
+    if src:
+        model.load_state_dict(load_checkpoint(src)["model"])
+    h = d["head"]
+    head = HEADS[h["type"]](d["model_cfg"].get("d", 256), h["C"], out=h["out"])
+    if h["window_logit"]:
+        head = WindowLogit(head)
+    reg = Regressor(model, head, d["frozen"], d["sig"])
+    keys = reg.load_state_dict(d["params"], strict=False)
+    if keys.unexpected_keys:
+        raise KeyError(f"{path}: parameters not in the model: {keys.unexpected_keys[:5]}")
+    return reg.to(device), d
+
+
+def _meta(model_cfg, seed, ckpt, head, frozen, epochs, lr, wd, batch_size, amp, n_train, n_test, seconds):
+    return {"model_cfg": model_cfg, "seed": seed, "ckpt": ckpt_info(ckpt), "arm": "finetune_frozen" if frozen
+            else ("finetune" if ckpt else "scratch"), "head_type": head, "epochs": epochs, "lr": lr, "wd": wd,
+            "batch_size": batch_size, "precision": "bf16" if amp == torch.bfloat16 else "fp32", "n_train": n_train,
+            "n_test": n_test, "seconds": seconds, "git": git_hash(),
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
 
 def fit_arm(train, test, model_cfg, seed, ckpt=None, head="attn", frozen=False, epochs=20, lr=1e-4, wd=5e-2,
-            batch_size=32, device="cpu"):
-    """One arm, one seed: finetune if ckpt is given, else scratch. Returns (test R², per-epoch loss history)."""
+            batch_size=32, device="cpu", amp=None, num_workers=0, cache_gib=12.0, out=None):
+    """One arm, one seed: finetune if ckpt is given, else scratch. Returns (test R², per-epoch loss history).
+    With out, saves params.pt, preds.npz (predictions in the label's units) and result.json there (U44)."""
+    t0 = time.time()
     seed_all(seed)
     model = IBrain(**model_cfg)
     if ckpt:
@@ -208,12 +367,18 @@ def fit_arm(train, test, model_cfg, seed, ckpt=None, head="attn", frozen=False, 
     # reach that scale at lr 1e-4. R² per dimension is unchanged by the same affine map on prediction and target.
     Y = np.concatenate([np.asarray(w["vel"], dtype=np.float64) for w in train])
     mu, sd = Y.mean(0), Y.std(0) + 1e-8
-    g = torch.Generator().manual_seed(seed)
-    dl_tr = DataLoader(LabeledWindows(train, mu, sd), batch_size, shuffle=True, collate_fn=collate_labeled,
-                       generator=g)
-    dl_te = DataLoader(LabeledWindows(test, mu, sd), batch_size, collate_fn=collate_labeled)
-    hist = train_regressor(reg, dl_tr, epochs, lr, wd, device)
-    return evaluate(reg, dl_te, device), hist
+    hist, pred, y = _fit(reg, LabeledWindows(train, mu, sd), LabeledWindows(test, mu, sd), collate_labeled, seed,
+                         epochs, lr, wd, batch_size, device, amp, num_workers, cache_gib, F.mse_loss)
+    D = y.shape[-1]
+    score = r2(pred.reshape(-1, D), y.reshape(-1, D))
+    if out:
+        meta = _meta(model_cfg, seed, ckpt, head, frozen, epochs, lr, wd, batch_size, amp, len(train), len(test),
+                     time.time() - t0)
+        scale = torch.as_tensor(sd, dtype=torch.float32), torch.as_tensor(mu, dtype=torch.float32)
+        save_fit(out, reg, {"type": head, "C": C, "out": D, "window_logit": False},
+                 {"metric": "r2", "score": score, "hist": hist, **meta}, pred * scale[0] + scale[1],
+                 y * scale[0] + scale[1], {**meta, "label_norm": {"mu": mu.tolist(), "sd": sd.tolist()}})
+    return score, hist
 
 
 def auc(score, y):
@@ -232,33 +397,33 @@ def ieeg_steps(ckpt):
     return sum(h.get("sig") == IEEG for h in load_checkpoint(ckpt)["hist"])
 
 
-@torch.no_grad()
-def evaluate_auc(clf, dl, device="cpu"):
-    clf.eval()
-    logits, ys = [], []
-    for x, valid, y in dl:
-        logits.append(clf(x.to(device), valid.to(device)).cpu())
-        ys.append(y)
-    return auc(torch.cat(logits).numpy(), torch.cat(ys).numpy())
+def evaluate_auc(clf, dl, device="cpu", amp=None):
+    logits, y = predict(clf, dl, device, amp)
+    return auc(logits.numpy(), y.numpy())
 
 
 def fit_classifier_arm(train, test, model_cfg, seed, ckpt=None, head="attn", frozen=False, epochs=20, lr=1e-4,
-                       wd=5e-2, batch_size=32, device="cpu"):
+                       wd=5e-2, batch_size=32, device="cpu", amp=None, num_workers=0, cache_gib=12.0, out=None):
     """One arm, one seed of a Brain Treebank task (U35): finetune if ckpt is given, else scratch. train and test are
     data_treebank window dicts of one subject. The model encodes with sig = IEEG; the U8 head gives one logit per
     window (WindowLogit); BCE with logits; the rest as U27. Labels are 0/1, so no z-scoring.
-    Returns (test AUC, per-epoch loss history)."""
+    Returns (test AUC, per-epoch loss history). With out, saves params.pt, preds.npz (logits) and result.json (U44)."""
+    t0 = time.time()
     seed_all(seed)
     model = IBrain(**model_cfg)
     if ckpt:
         model.load_state_dict(load_checkpoint(ckpt, device)["model"])
     C = max(w["wave"].shape[0] for w in train + test)
     clf = Regressor(model, WindowLogit(HEADS[head](model_cfg.get("d", 256), C, out=1)), frozen, sig=IEEG)
-    g = torch.Generator().manual_seed(seed)
-    dl_tr = DataLoader(TreebankWindows(train), batch_size, shuffle=True, collate_fn=collate_treebank, generator=g)
-    dl_te = DataLoader(TreebankWindows(test), batch_size, collate_fn=collate_treebank)
-    hist = train_regressor(clf, dl_tr, epochs, lr, wd, device, loss_fn=F.binary_cross_entropy_with_logits)
-    return evaluate_auc(clf, dl_te, device), hist
+    hist, logits, y = _fit(clf, TreebankWindows(train), TreebankWindows(test), collate_treebank, seed, epochs, lr,
+                           wd, batch_size, device, amp, num_workers, cache_gib, F.binary_cross_entropy_with_logits)
+    score = auc(logits.numpy(), y.numpy())
+    if out:
+        meta = _meta(model_cfg, seed, ckpt, head, frozen, epochs, lr, wd, batch_size, amp, len(train), len(test),
+                     time.time() - t0)
+        save_fit(out, clf, {"type": head, "C": C, "out": 1, "window_logit": True},
+                 {"metric": "auc", "score": score, "hist": hist, **meta}, logits, y, {**meta, "label_norm": None})
+    return score, hist
 
 
 def ridge_r2(train, test, lams=(1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0), seed=0):
