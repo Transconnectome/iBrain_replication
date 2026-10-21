@@ -193,6 +193,7 @@ ibrain-repro/
     check_collapse.py  collapse metrics of checkpoints against the initialized model (U38)
     pool_diagnostic.py does pooling erase what tells windows apart: tokens vs mean/max/pre-LN pooling (U6, U7)
     profile_step.py    where a step's time goes: data wait, compute, FLOPs, kernels; eager vs compiled (U39, U40)
+    monitor_run.py     health check of a running pretraining: Slurm segments, stalls, NaN, median losses, d_gap/r_std, checkpoints, backup (login node, stdlib only)
     slurm/             lab-server sbatch files
       pretrain.sbatch  pretraining on node1 with .venv: token_budget check, then train (auto-resume from ckpt.pt)
       profile_memory.sbatch  memory table without and with activation checkpointing
