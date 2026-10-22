@@ -1,0 +1,84 @@
+commit=38194f5
+windows train=4563 test=1126; inner train=3642 val=921
+velocity per dim: mean [ 6.82693674 -0.30687052], std [140.45414633 126.21148699]; mean count per bin 0.0589
+== ridge (test R2)
+  U27 grid: R2 0.3379 lambda 1000
+  wide grid: R2 0.3397 lambda 10000
+  context -1..+1: R2 0.5414 lambda 10000
+  causal -2..0: R2 0.5654 lambda 10000
+== scratch sweep (inner validation R2)
+-- lr=0.0001 const bf16 100ep
+  epoch 10: train loss 0.9922, train R2 0.0246, eval R2 0.0086 (110 s)
+  epoch 20: train loss 0.9799, train R2 -0.0066, eval R2 -0.0214 (218 s)
+  epoch 30: train loss 0.9789, train R2 0.0406, eval R2 0.0259 (326 s)
+  epoch 40: train loss 0.9764, train R2 0.0537, eval R2 0.0272 (434 s)
+  epoch 50: train loss 0.9526, train R2 0.0688, eval R2 0.0269 (542 s)
+  epoch 60: train loss 0.9201, train R2 0.0847, eval R2 0.0130 (650 s)
+  epoch 70: train loss 0.8692, train R2 0.1592, eval R2 0.0262 (757 s)
+  epoch 80: train loss 0.7803, train R2 0.2488, eval R2 -0.0869 (865 s)
+  epoch 90: train loss 0.6347, train R2 0.3056, eval R2 -0.2898 (973 s)
+  epoch 100: train loss 0.4371, train R2 0.5059, eval R2 -0.5274 (1081 s)
+-- lr=0.0003 const bf16 100ep
+  epoch 10: train loss 0.9916, train R2 0.0129, eval R2 0.0061 (108 s)
+  epoch 20: train loss 0.9761, train R2 0.0482, eval R2 0.0318 (216 s)
+  epoch 30: train loss 0.9587, train R2 0.0684, eval R2 0.0313 (324 s)
+  epoch 40: train loss 0.9445, train R2 0.0641, eval R2 0.0170 (432 s)
+  epoch 50: train loss 0.9102, train R2 0.0798, eval R2 -0.0092 (540 s)
+  epoch 60: train loss 0.8607, train R2 0.1495, eval R2 -0.0144 (648 s)
+  epoch 70: train loss 0.7578, train R2 0.3093, eval R2 -0.0860 (756 s)
+  epoch 80: train loss 0.5446, train R2 0.4882, eval R2 -0.4056 (864 s)
+  epoch 90: train loss 0.3302, train R2 0.6639, eval R2 -0.5026 (972 s)
+  epoch 100: train loss 0.1892, train R2 0.7368, eval R2 -0.5694 (1080 s)
+-- lr=0.001 const bf16 100ep
+  epoch 10: train loss 0.9982, train R2 0.0018, eval R2 -0.0032 (108 s)
+  epoch 20: train loss 1.0006, train R2 0.0029, eval R2 0.0020 (216 s)
+  epoch 30: train loss 0.9861, train R2 0.0178, eval R2 0.0113 (324 s)
+  epoch 40: train loss 0.9840, train R2 0.0194, eval R2 0.0126 (432 s)
+  epoch 50: train loss 0.9819, train R2 0.0218, eval R2 0.0135 (540 s)
+  epoch 60: train loss 0.9867, train R2 0.0097, eval R2 0.0054 (648 s)
+  epoch 70: train loss 0.9911, train R2 0.0078, eval R2 0.0019 (756 s)
+  epoch 80: train loss 0.9859, train R2 0.0218, eval R2 0.0095 (864 s)
+  epoch 90: train loss 0.9842, train R2 0.0152, eval R2 0.0060 (972 s)
+  epoch 100: train loss 0.9857, train R2 0.0139, eval R2 0.0080 (1080 s)
+-- lr=0.0001 cosine bf16 100ep
+  epoch 10: train loss 0.9871, train R2 0.0347, eval R2 0.0213 (108 s)
+  epoch 20: train loss 0.9566, train R2 0.0774, eval R2 0.0237 (216 s)
+  epoch 30: train loss 0.8360, train R2 0.2216, eval R2 -0.0140 (324 s)
+  epoch 40: train loss 0.5588, train R2 0.4408, eval R2 -0.2103 (432 s)
+  epoch 50: train loss 0.2972, train R2 0.7077, eval R2 -0.4607 (540 s)
+  epoch 60: train loss 0.1412, train R2 0.8288, eval R2 -0.5321 (648 s)
+  epoch 70: train loss 0.0749, train R2 0.8532, eval R2 -0.6540 (756 s)
+  epoch 80: train loss 0.0447, train R2 0.8986, eval R2 -0.5622 (864 s)
+  epoch 90: train loss 0.0336, train R2 0.8949, eval R2 -0.6095 (972 s)
+  epoch 100: train loss 0.0308, train R2 0.9004, eval R2 -0.5841 (1080 s)
+-- lr=0.0003 cosine bf16 100ep
+  epoch 10: train loss 0.9937, train R2 0.0331, eval R2 0.0216 (108 s)
+  epoch 20: train loss 0.9851, train R2 0.0389, eval R2 0.0212 (216 s)
+  epoch 30: train loss 0.9876, train R2 0.0258, eval R2 0.0166 (324 s)
+  epoch 40: train loss 0.9661, train R2 0.0438, eval R2 0.0252 (432 s)
+  epoch 50: train loss 0.9477, train R2 0.0610, eval R2 0.0253 (540 s)
+  epoch 60: train loss 0.9058, train R2 0.1160, eval R2 0.0044 (648 s)
+  epoch 70: train loss 0.8021, train R2 0.2380, eval R2 -0.0531 (756 s)
+  epoch 80: train loss 0.6581, train R2 0.3289, eval R2 -0.2379 (864 s)
+  epoch 90: train loss 0.5695, train R2 0.3585, eval R2 -0.3796 (972 s)
+  epoch 100: train loss 0.5494, train R2 0.3540, eval R2 -0.4097 (1079 s)
+-- lr=0.001 cosine bf16 100ep
+  epoch 10: train loss 0.9975, train R2 -0.0471, eval R2 -0.0544 (108 s)
+  epoch 20: train loss 0.9893, train R2 0.0210, eval R2 0.0134 (216 s)
+  epoch 30: train loss 0.9860, train R2 0.0184, eval R2 0.0074 (324 s)
+  epoch 40: train loss 0.9875, train R2 0.0158, eval R2 0.0079 (432 s)
+  epoch 50: train loss 0.9827, train R2 0.0103, eval R2 -0.0010 (539 s)
+  epoch 60: train loss 0.9744, train R2 0.0346, eval R2 0.0189 (647 s)
+  epoch 70: train loss 0.9608, train R2 0.0403, eval R2 0.0155 (755 s)
+  epoch 80: train loss 0.9550, train R2 0.0466, eval R2 0.0085 (863 s)
+  epoch 90: train loss 0.9470, train R2 0.0582, eval R2 -0.0011 (971 s)
+  epoch 100: train loss 0.9432, train R2 0.0614, eval R2 -0.0031 (1079 s)
+-- lr=0.0001 const fp32 50ep
+  epoch 10: train loss 0.9785, train R2 0.0365, eval R2 0.0186 (281 s)
+  epoch 20: train loss 0.9497, train R2 0.0749, eval R2 0.0393 (562 s)
+  epoch 30: train loss 0.8412, train R2 0.1995, eval R2 0.0022 (843 s)
+  epoch 40: train loss 0.6486, train R2 0.3487, eval R2 -0.0389 (1125 s)
+  epoch 50: train loss 0.3948, train R2 0.6029, eval R2 -0.3151 (1406 s)
+== final: lr=0.0003 const bf16 100ep at epoch 20 (val R2 0.0318), whole train -> test
+  epoch 20: train loss 0.9677, train R2 0.0489, eval R2 0.0257 (267 s)
+{"setting": "lr=0.0003 const bf16 100ep", "epochs": 20, "val_r2": 0.03183987736701965, "test_r2": 0.025654137134552002, "train_r2": 0.04889848828315735}

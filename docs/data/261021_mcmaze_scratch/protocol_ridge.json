@@ -1,0 +1,10 @@
+{
+  "metric": "r2",
+  "score": 0.3379134198857562,
+  "lambda": 1000.0,
+  "arm": "ridge",
+  "n_train": 4563,
+  "n_test": 1126,
+  "git": "55eba36e054d12f70369261ea0aea65824f12ea9-dirty",
+  "seconds": 4.781188488006592
+}
